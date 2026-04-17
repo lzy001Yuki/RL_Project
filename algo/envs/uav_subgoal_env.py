@@ -103,11 +103,16 @@ class UAVSubgoalEnv:
         self._prev_subgoal_dist = float(np.linalg.norm(sensor[2:4]))
         return obs
 
-    def set_subgoal(self, subgoal_xy: np.ndarray) -> None:
+    def set_subgoal(self, subgoal_xy: np.ndarray, is_final:bool) -> Dict[str, torch.Tensor]:
         if self.subgoal_xy is None:
             raise RuntimeError("reset() must be called before set_subgoal()")
         self.subgoal_xy = np.array(subgoal_xy, dtype=np.float64).copy()
-        self._prev_subgoal_dist = None
+        obs = self._get_obs()
+        sensor = obs["sensor"].detach().cpu().numpy()
+        self._prev_subgoal_dist = float(np.linalg.norm(sensor[2:4]))
+        if is_final:
+            self.success_radius = 30.0
+        return obs
 
     def step(self, action: torch.Tensor):
         if self.curr_pose is None or self.subgoal_xy is None or self.final_goal_xy is None:
@@ -142,7 +147,6 @@ class UAVSubgoalEnv:
 
         done = False
         info: Dict[str, object] = {}
-
         # Termination
         if obstacle_dist <= self.collision_threshold:
             done = True
@@ -162,7 +166,7 @@ class UAVSubgoalEnv:
         # Reward
         reward = 0.0
         if self._prev_subgoal_dist is not None:
-            reward += (self._prev_subgoal_dist - subgoal_dist)
+            reward += (self._prev_subgoal_dist - subgoal_dist) * 5
 
         if obstacle_dist <= self.collision_threshold:
             reward -= self._collision_penalty
