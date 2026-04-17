@@ -7,7 +7,6 @@ Usage:
 """
 
 import os
-import sys
 import json
 import time
 import argparse
@@ -27,6 +26,12 @@ def parse_args():
     parser.add_argument("--pointcloud_path", type=str, required=True)
     parser.add_argument("--initials_path", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--take_first_n", type=int, default=20,
+                        help="Use the first N initials from initials_path (default: 20).")
+    parser.add_argument("--trajs_per_initial", type=int, default=100,
+                        help="Number of successful trajectories to save per initial (default: 100).")
+    parser.add_argument("--output_trajs_dir", type=str, default=None,
+                        help="Output directory in baseline_trajs format. Default: <save_dir>/baseline_trajs")
     parser.add_argument("--max_iter", type=int, default=100000)
     parser.add_argument("--max_steps", type=int, default=300)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -50,6 +55,15 @@ def parse_args():
 def main():
     args = parse_args()
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size > 1:
+        rank = int(os.environ.get("RANK", "0"))
+        raise RuntimeError(
+            f"_instructor/train.py is not safe to run with torchrun/DDP "
+            f"(WORLD_SIZE={world_size}, RANK={rank}). Run a single process, "
+            f"or use the repo root `train_ppo.py` / `train_sac.py` which are DDP-aware."
+        )
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
@@ -60,14 +74,48 @@ def main():
     # Load initials
     with open(args.initials_path) as f:
         initials = json.load(f)
+    if args.take_first_n is not None and int(args.take_first_n) > 0:
+        initials = initials[: int(args.take_first_n)]
     print(f"Loaded {len(initials)} initials")
+    initial_ids = []
+    for i, init in enumerate(initials):
+        try:
+            initial_ids.append(int(init.get("initial_id", i)))
+        except Exception:
+            initial_ids.append(int(i))
+    if len(set(initial_ids)) != len(initial_ids):
+        print("WARNING: duplicate initial_id values detected in initials list.")
+    if len(initial_ids) > 0:
+        preview = initial_ids[: min(10, len(initial_ids))]
+        print(f"Initial IDs (preview): {preview}{' ...' if len(initial_ids) > len(preview) else ''}")
 
     # Experiment directory
     if args.save_dir is None:
         args.save_dir = os.path.join("saved_data", f"run_{int(time.time())}")
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(os.path.join(args.save_dir, "controllers"), exist_ok=True)
-    os.makedirs(os.path.join(args.save_dir, "success_trajs"), exist_ok=True)
+    if args.output_trajs_dir is None:
+        args.output_trajs_dir = os.path.join(args.save_dir, "baseline_trajs")
+    os.makedirs(args.output_trajs_dir, exist_ok=True)
+    saved_counts = []
+    for env_idx, iid in enumerate(initial_ids):
+        init_dir = os.path.join(args.output_trajs_dir, f"initial_{iid}")
+        os.makedirs(init_dir, exist_ok=True)
+        # Resume-friendly: continue from existing traj files if present.
+        existing = []
+        try:
+            existing = os.listdir(init_dir)
+        except Exception:
+            existing = []
+        ids = []
+        for name in existing:
+            if not (name.startswith("traj_") and name.endswith(".txt")):
+                continue
+            try:
+                ids.append(int(name[len("traj_") : -len(".txt")]))
+            except Exception:
+                continue
+        saved_counts.append((max(ids) + 1) if ids else 0)
 
     with open(os.path.join(args.save_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
@@ -113,41 +161,52 @@ def main():
         rollouts.obs[key][0].copy_(obs[key])
     rollouts.to(device)
 
-    # Trajectory buffer for saving successful trajectories
-    traj = [obs["sensor"].cpu().squeeze().numpy()[:2].tolist()]  # start as [obs_x, obs_y]
-    # Actually save current pose
+    # Trajectory buffer for saving successful trajectories (in baseline_trajs format).
     traj = [[env.curr_pose[0], env.curr_pose[1]]]
-
     episode_rewards = deque(maxlen=50)
     start_time = time.time()
 
     print(f"\nStarting training (max_iter={args.max_iter})...\n")
 
+    def _done_collecting():
+        target = int(args.trajs_per_initial)
+        return len(saved_counts) > 0 and all(c >= target for c in saved_counts)
+
     for j in range(args.max_iter):
+        if _done_collecting():
+            break
+        collecting_done = False
         for step in range(args.num_steps):
             with torch.no_grad():
                 value, action, action_log_prob = actor_critic.act(
                     {k: rollouts.obs[k][step] for k in rollouts.obs})
 
             obs, reward, done, infos = env.step(action)
-            traj.append([env.curr_pose[0], env.curr_pose[1]])
+            info0 = infos[0] if len(infos) > 0 else {}
+            if done[0] and "final_pose" in info0:
+                fp = info0["final_pose"]
+                traj.append([float(fp[0]), float(fp[1])])
+            else:
+                traj.append([env.curr_pose[0], env.curr_pose[1]])
 
             for info in infos:
                 if "episode" in info:
                     episode_rewards.append(info["episode"]["r"])
 
                     if info.get("won", False):
-                        n_success = len(os.listdir(
-                            os.path.join(args.save_dir, "success_trajs")))
-                        traj_path = os.path.join(
-                            args.save_dir, "success_trajs", f"{n_success}.txt")
-                        with open(traj_path, "w") as f:
-                            ip = info["initial_pose"]
-                            tc = info["target_center"]
-                            f.write(f"{ip[0]} {ip[1]}\n")
-                            f.write(f"{tc[0]} {tc[1]}\n")
-                            for px, py in traj:
-                                f.write(f"{px} {py}\n")
+                        init_idx = int(info.get("initial_index", -1))
+                        if 0 <= init_idx < len(saved_counts):
+                            iid = initial_ids[init_idx]
+                            k = int(saved_counts[init_idx])
+                            if k < int(args.trajs_per_initial):
+                                traj_path = os.path.join(
+                                    args.output_trajs_dir, f"initial_{iid}", f"traj_{k}.txt")
+                                with open(traj_path, "w") as f:
+                                    for px, py in traj:
+                                        f.write(f"{float(px)} {float(py)}\n")
+                                saved_counts[init_idx] += 1
+
+                    # New episode starts after env auto-reset.
                     traj = [[env.curr_pose[0], env.curr_pose[1]]]
 
             masks = torch.FloatTensor([[0.0] if d else [1.0] for d in done]).to(device)
@@ -156,6 +215,13 @@ def main():
             ).to(device)
             rhs = torch.zeros(1, actor_critic.recurrent_hidden_state_size).to(device)
             rollouts.insert(obs, rhs, action, action_log_prob, value, reward, masks, bad_masks)
+
+            if _done_collecting():
+                collecting_done = True
+                break
+
+        if collecting_done:
+            break
 
         with torch.no_grad():
             next_value = actor_critic.get_value(
@@ -168,7 +234,7 @@ def main():
         if j % args.log_interval == 0 and len(episode_rewards) > 0:
             elapsed = time.time() - start_time
             total_steps = (j + 1) * args.num_steps
-            n_success = len(os.listdir(os.path.join(args.save_dir, "success_trajs")))
+            n_success = int(sum(saved_counts))
             print(f"[Iter {j:6d}] steps={total_steps:8d}  "
                   f"reward={np.mean(episode_rewards):7.1f}  "
                   f"success_trajs={n_success}  "
@@ -176,7 +242,7 @@ def main():
                   f"elapsed={elapsed:.0f}s")
 
             with open(os.path.join(args.save_dir, "train_log.txt"), "a") as f:
-                f.write(f"{j}\t{np.mean(episode_rewards):.4f}\t{n_success}\n")
+                f.write(f"{j}\t{np.mean(episode_rewards):.4f}\t{n_success}\t{saved_counts}\n")
 
         if j % args.save_interval == 0 and j > 0:
             torch.save(actor_critic.state_dict(),
@@ -185,6 +251,10 @@ def main():
     torch.save(actor_critic.state_dict(),
                os.path.join(args.save_dir, "controllers", "final_controller.pt"))
     print("\nTraining complete!")
+    print(f"Saved counts per env-index: {saved_counts}")
+    if len(saved_counts) == len(initial_ids):
+        saved_by_id = {int(iid): int(c) for iid, c in zip(initial_ids, saved_counts)}
+        print(f"Saved counts per initial_id: {saved_by_id}")
 
 
 if __name__ == "__main__":

@@ -99,21 +99,26 @@ class UAVNavEnv(gym.Env):
         # --- Check termination conditions ---
         done = False
         info = {}
+        episode_initial_index = int(self.initial_index)
+        final_pose = copy.deepcopy(self.curr_pose)
 
         # Collision
         if obstacle_dist <= self.collision_threshold:
             done = True
             info["won"] = False
+            info["term_reason"] = "collision"
 
         # Success
         if target_dist <= self.success_radius:
             done = True
             info["won"] = True
+            info["term_reason"] = "success"
 
         self.step_count += 1
         if self.step_count >= self.max_steps and not done:
             done = True
             info["won"] = False
+            info["term_reason"] = "timeout"
 
         # --- Reward computation ---
         reward = 0.0
@@ -141,6 +146,8 @@ class UAVNavEnv(gym.Env):
             info["episode"] = {"r": self.episode_reward}
             info["initial_pose"] = copy.deepcopy(self.initial_pose)
             info["target_center"] = copy.deepcopy(self.target_center)
+            info["initial_index"] = episode_initial_index
+            info["final_pose"] = final_pose
 
             # Auto-reset: sample next initial
             self._sample_next_initial(info.get("won", False))
