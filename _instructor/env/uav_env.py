@@ -30,8 +30,15 @@ class UAVNavEnv(gym.Env):
         "action_limit": [2.0, 2.0],
     }
 
-    def __init__(self, pointcloud_path, env_params=None, save_dir=None,
-                 device=None, initials=None):
+    def __init__(
+        self,
+        pointcloud_path,
+        env_params=None,
+        save_dir=None,
+        device=None,
+        initials=None,
+        auto_reset: bool = True,
+    ):
         super().__init__()
         params = {**self.DEFAULT_PARAMS, **(env_params or {})}
 
@@ -41,6 +48,7 @@ class UAVNavEnv(gym.Env):
         self.action_limit = np.array(params["action_limit"])
         self.device = device or torch.device("cpu")
         self.save_dir = save_dir
+        self.auto_reset = bool(auto_reset)
 
         self.initials = initials or []
         self.initial_index = 0
@@ -142,19 +150,21 @@ class UAVNavEnv(gym.Env):
             info["initial_pose"] = copy.deepcopy(self.initial_pose)
             info["target_center"] = copy.deepcopy(self.target_center)
 
-            # Auto-reset: sample next initial
-            self._sample_next_initial(info.get("won", False))
-            obs = self.reset(
-                initial_pose=np.array([
-                    self.initials[self.initial_index]["x_start"],
-                    self.initials[self.initial_index]["y_start"],
-                    0.0
-                ]),
-                target_center=np.array([
-                    self.initials[self.initial_index]["target_center_x"],
-                    self.initials[self.initial_index]["target_center_y"],
-                ])
-            )
+            # Auto-reset (training convenience). For offline rollout/export you usually want
+            # auto_reset=False and handle resets in the caller.
+            if self.auto_reset and len(self.initials) > 0:
+                self._sample_next_initial(info.get("won", False))
+                obs = self.reset(
+                    initial_pose=np.array([
+                        self.initials[self.initial_index]["x_start"],
+                        self.initials[self.initial_index]["y_start"],
+                        0.0
+                    ]),
+                    target_center=np.array([
+                        self.initials[self.initial_index]["target_center_x"],
+                        self.initials[self.initial_index]["target_center_y"],
+                    ])
+                )
 
         return obs, torch.tensor([reward]), [done], [info]
 

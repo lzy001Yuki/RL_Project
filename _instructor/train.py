@@ -28,6 +28,7 @@ from collections import deque
 import torch
 
 from env.uav_env import UAVNavEnv
+from env.subproc_vec_env import UAVSubprocVecEnv
 from ppo.ppo import PPO
 from ppo.storage import DictRolloutStorage
 from model import Policy
@@ -38,6 +39,12 @@ def parse_args():
     parser.add_argument("--pointcloud_path", type=str, required=True)
     parser.add_argument("--initials_path", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help="Number of parallel environments (subprocesses) for faster sampling.",
+    )
     parser.add_argument(
         "--pretrained_path",
         type=str,
@@ -101,13 +108,23 @@ def main():
         "collision_threshold": 2.0,
         "action_limit": [2.0, 2.0],
     }
-    env = UAVNavEnv(
-        pointcloud_path=args.pointcloud_path,
-        env_params=env_params,
-        save_dir=args.save_dir,
-        device=device,
-        initials=initials,
-    )
+    if args.num_envs == 1:
+        env = UAVNavEnv(
+            pointcloud_path=args.pointcloud_path,
+            env_params=env_params,
+            save_dir=args.save_dir,
+            device=device,
+            initials=initials,
+        )
+    else:
+        env = UAVSubprocVecEnv(
+            args.num_envs,
+            pointcloud_path=args.pointcloud_path,
+            env_params=env_params,
+            save_dir=args.save_dir,
+            device=device,
+            initials=initials,
+        )
 
     # Create policy and PPO agent
     actor_critic = Policy(obs_dim=4, action_dim=2, action_limit=(2.0, 2.0))
@@ -136,26 +153,40 @@ def main():
 
     # Rollout storage
     rollouts = DictRolloutStorage(
-        args.num_steps, 1, env.observation_shape, env.action_shape,
+        args.num_steps, args.num_envs, env.observation_shape, env.action_shape,
         actor_critic.recurrent_hidden_state_size,
     )
 
     # Initial reset
-    init0 = initials[0]
-    obs = env.reset(
-        initial_pose=np.array([init0["x_start"], init0["y_start"], 0.0]),
-        target_center=np.array([init0["target_center_x"], init0["target_center_y"]]),
-    )
+    if args.num_envs == 1:
+        init0 = initials[0]
+        obs = env.reset(
+            initial_pose=np.array([init0["x_start"], init0["y_start"], 0.0]),
+            target_center=np.array([init0["target_center_x"], init0["target_center_y"]]),
+        )
+    else:
+        init_poses = []
+        targets = []
+        for i in range(args.num_envs):
+            init = initials[i % len(initials)]
+            init_poses.append([init["x_start"], init["y_start"], 0.0])
+            targets.append([init["target_center_x"], init["target_center_y"]])
+        obs = env.reset(np.array(init_poses, dtype=np.float64), np.array(targets, dtype=np.float64))
+
     for key in obs:
         rollouts.obs[key][0].copy_(obs[key])
     rollouts.to(device)
 
     # Trajectory buffer for saving successful trajectories
-    traj = [obs["sensor"].cpu().squeeze().numpy()[:2].tolist()]  # start as [obs_x, obs_y]
-    # Actually save current pose
-    traj = [[env.curr_pose[0], env.curr_pose[1]]]
+    if args.num_envs == 1:
+        traj = [obs["sensor"].cpu().squeeze().numpy()[:2].tolist()]  # start as [obs_x, obs_y]
+        # Actually save current pose
+        traj = [[env.curr_pose[0], env.curr_pose[1]]]
+    else:
+        traj = None
 
     episode_rewards = deque(maxlen=50)
+    total_success = 0
     start_time = time.time()
 
     print(f"\nStarting training (max_iter={args.max_iter})...\n")
@@ -167,31 +198,36 @@ def main():
                     {k: rollouts.obs[k][step] for k in rollouts.obs})
 
             obs, reward, done, infos = env.step(action)
-            traj.append([env.curr_pose[0], env.curr_pose[1]])
+            if args.num_envs == 1:
+                traj.append([env.curr_pose[0], env.curr_pose[1]])
 
             for info in infos:
                 if "episode" in info:
                     episode_rewards.append(info["episode"]["r"])
 
                     if info.get("won", False):
-                        n_success = len(os.listdir(
-                            os.path.join(args.save_dir, "success_trajs")))
-                        traj_path = os.path.join(
-                            args.save_dir, "success_trajs", f"{n_success}.txt")
-                        with open(traj_path, "w") as f:
-                            ip = info["initial_pose"]
-                            tc = info["target_center"]
-                            f.write(f"{ip[0]} {ip[1]}\n")
-                            f.write(f"{tc[0]} {tc[1]}\n")
-                            for px, py in traj:
-                                f.write(f"{px} {py}\n")
-                    traj = [[env.curr_pose[0], env.curr_pose[1]]]
+                        total_success += 1
+                        if args.num_envs == 1 and traj is not None:
+                            n_success = len(os.listdir(
+                                os.path.join(args.save_dir, "success_trajs")))
+                            traj_path = os.path.join(
+                                args.save_dir, "success_trajs", f"{n_success}.txt")
+                            with open(traj_path, "w") as f:
+                                ip = info["initial_pose"]
+                                tc = info["target_center"]
+                                f.write(f"{ip[0]} {ip[1]}\n")
+                                f.write(f"{tc[0]} {tc[1]}\n")
+                                for px, py in traj:
+                                    f.write(f"{px} {py}\n")
+
+                    if args.num_envs == 1:
+                        traj = [[env.curr_pose[0], env.curr_pose[1]]]
 
             masks = torch.FloatTensor([[0.0] if d else [1.0] for d in done]).to(device)
             bad_masks = torch.FloatTensor(
                 [[0.0] if "bad_transition" in info else [1.0] for info in infos]
             ).to(device)
-            rhs = torch.zeros(1, actor_critic.recurrent_hidden_state_size).to(device)
+            rhs = torch.zeros(args.num_envs, actor_critic.recurrent_hidden_state_size).to(device)
             rollouts.insert(obs, rhs, action, action_log_prob, value, reward, masks, bad_masks)
 
         with torch.no_grad():
@@ -204,8 +240,11 @@ def main():
 
         if j % args.log_interval == 0 and len(episode_rewards) > 0:
             elapsed = time.time() - start_time
-            total_steps = (j + 1) * args.num_steps
-            n_success = len(os.listdir(os.path.join(args.save_dir, "success_trajs")))
+            total_steps = (j + 1) * args.num_steps * args.num_envs
+            if args.num_envs == 1:
+                n_success = len(os.listdir(os.path.join(args.save_dir, "success_trajs")))
+            else:
+                n_success = total_success
             print(f"[Iter {j:6d}] steps={total_steps:8d}  "
                   f"reward={np.mean(episode_rewards):7.1f}  "
                   f"success_trajs={n_success}  "
@@ -221,6 +260,8 @@ def main():
 
     torch.save(actor_critic.state_dict(),
                os.path.join(args.save_dir, "controllers", "final_controller.pt"))
+    if hasattr(env, "close"):
+        env.close()
     print("\nTraining complete!")
 
 

@@ -203,3 +203,40 @@ python tools/visualize_trajs.py \
 
 - [OpenFly Platform](https://github.com/SHAILAB-IPEC/OpenFly-Platform)
 - J. Schulman et al., "Proximal Policy Optimization Algorithms," arXiv:1707.06347, 2017.
+
+
+
+
+已加的“分布式训练/并行采样”
+
+  - 新增子进程并行环境：_instructor/env/subproc_vec_env.py:1（UAVSubprocVecEnv，每个 worker 独立
+    跑一个 UAVNavEnv，主进程做 PPO 更新）
+  - PPO 训练脚本支持 --num_envs：_instructor/train.py:1
+      - 单环境：--num_envs 1（默认，行为和原版一致，仍会边训练边把成功轨迹写到 saved_data/.../
+        success_trajs/）
+      - 多环境：--num_envs N（并行采样更快；为了避免多环境下保存轨迹的复杂同步，这里默认不再写
+        success_trajs 文件，只在日志里累计 success_trajs=total_success）
+
+  示例（BC warm start + 多环境 PPO 微调）：
+
+  - cd _instructor
+  - python train.py --pointcloud_path ../data/pointcloud_2d.npy --initials_path ../data/
+    eval_initials_20.json --pretrained_path saved_data/bc_controller.pt --num_envs 8
+
+  ———
+
+  导出 submission 的脚本
+
+  - 新增：_instructor/export_submission.py:1
+      - 读取训练好的 controller.pt，对每个 initial 反复 rollout 直到收集到足够的成功轨迹，并写成
+        你们评测要求的目录结构（每行只有 x y，无 header）。
+
+  示例：
+
+  - cd _instructor
+  - python export_submission.py --pointcloud_path ../data/pointcloud_2d.npy --initials_path ../
+    data/eval_initials_20.json --controller_path saved_data/run_x/controllers/
+    final_controller.pt --out_dir ../submission --trajs_per_initial 20
+  - 想更“多样”一点：加噪声导出
+      - python export_submission.py ... --action_noise_std 0.2
+      - 或者保持随机采样（默认非 deterministic）；--deterministic 会让轨迹更一致、但多样性更差。
