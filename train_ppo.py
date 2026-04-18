@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initials_path", type=str, required=True)
     parser.add_argument("--save_dir", type=str, default=None)
 
-    parser.add_argument("--max_iter", type=int, default=20000)
+    parser.add_argument("--max_iter", type=int, default=100000)
     parser.add_argument("--max_steps", type=int, default=300)
 
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subgoal_max_m", type=float, default=160.0)
     parser.add_argument("--grid_resolution_m", type=float, default=1.0)
     parser.add_argument("--grid_padding_m", type=float, default=5.0)
+    parser.add_argument("--plan_only", action="store_true",
+                        help="Only run dynamic-cost A* planning and save planned paths, without PPO training.")
     parser.add_argument("--grid_inflation_radius_m", type=float, default=4.0)
     parser.add_argument("--goal_success_radius_m", type=float, default=30.0,
                         help="Plan to a free proxy cell within this radius of target center.")
@@ -60,10 +62,16 @@ def parse_args() -> argparse.Namespace:
                         help="If start cell is occupied, snap to a nearby free cell within this radius.")
 
     # Residual RL: action_env = action_guide(A*) + action_residual(PPO)
-    parser.add_argument("--residual_frac", type=float, default=0.80,
+    parser.add_argument("--residual_frac", type=float, default=0.55,
                         help="Fraction of action limit reserved for PPO residual (rest used by A* guide).")
     parser.add_argument("--guide_lookahead_m", type=float, default=10.0,
                         help="Lookahead distance (meters) along the A* path for guide action.")
+    parser.add_argument("--guide_gain_start", type=float, default=1.0,
+                        help="Initial multiplier for guide action scale.")
+    parser.add_argument("--guide_gain_end", type=float, default=1.0,
+                        help="Final multiplier for guide action scale after curriculum decay.")
+    parser.add_argument("--guide_gain_decay_iters", type=int, default=0,
+                        help="Linear decay length in iterations (<=0 uses max_iter).")
     parser.add_argument("--subgoal_stride_m", type=float, default=40.0,
                         help="Distance between chained subgoals along selected path.")
     parser.add_argument("--final_goal_radius_m", type=float, default=30.0,
@@ -72,10 +80,22 @@ def parse_args() -> argparse.Namespace:
     # Multi-path planning (instead of single fixed A* route).
     parser.add_argument("--n_paths", type=int, default=8,
                         help="Number of diverse A* candidates per initial.")
-    parser.add_argument("--path_repulsion_strength", type=float, default=2.0)
+    parser.add_argument("--path_repulsion_strength", type=float, default=5.0)
     parser.add_argument("--path_repulsion_radius_cells", type=int, default=2)
     parser.add_argument("--path_repulsion_weight", type=float, default=2.0)
     parser.add_argument("--path_detour_ratio_max", type=float, default=1.8)
+    parser.add_argument("--path_memory_decay", type=float, default=0.99,
+                        help="Decay factor of planning-time memory in dynamic-cost A*.")
+    parser.add_argument("--path_memory_max", type=float, default=50.0,
+                        help="Clip ceiling of planning-time memory map.")
+    parser.add_argument("--path_fade_near_m", type=float, default=60.0,
+                        help="Inside this distance to goal, repulsion weight fades toward path_fade_w_min.")
+    parser.add_argument("--path_fade_far_frac", type=float, default=0.8,
+                        help="Far distance = max(path_fade_near_m+1, frac*start_to_goal).")
+    parser.add_argument("--path_fade_w_min", type=float, default=0.1,
+                        help="Minimum fade weight near goal, in [0,1].")
+    parser.add_argument("--path_cost_noise", type=float, default=0.0,
+                        help="Optional random tie-break noise added to planning cost_map.")
     parser.add_argument("--path_select_random_prob", type=float, default=0.15,
                         help="Randomly sample a path with this probability for exploration.")
     parser.add_argument(
@@ -105,7 +125,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dist_backend", type=str, default=None,
                         help="DDP backend (default: nccl if cuda else gloo)")
-
+    parser.add_argument("--load_checkpoint", type=str, default=None,
+                        help="Optional path to a saved policy checkpoint for continuing PPO training.")
+    parser.add_argument("--path_shape_top_k", type=int, default=0,
+                        help="Keep top-K shape-diverse paths per initial (<=0 keeps all planned paths).")
+    parser.add_argument("--path_shape_turn_thresh_deg", type=float, default=20.0,
+                        help="Turn event threshold (degrees) for path-shape feature extraction.")
     # Online trajectory collection during training (rank0 only).
     parser.add_argument("--collect_during_train", action="store_true")
     parser.add_argument("--collect_initials_path", type=str, default=None,
@@ -114,6 +139,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collect_trajs_per_initial", type=int, default=100)
     parser.add_argument("--collect_output_dir", type=str, default=None,
                         help="Output dir in baseline format (default: <save_dir>/baseline_trajs).")
+    parser.add_argument("--collect_plan_output_dir", type=str, default=None,
+                        help="Output dir for planned paths (default: <save_dir>/baseline_plans).")
     parser.add_argument("--stop_when_collected", action="store_true",
                         help="Stop training once collection target is met.")
     return parser.parse_args()
@@ -267,6 +294,38 @@ def _path_memory_mean(path_xy: np.ndarray, grid, memory_map: np.ndarray) -> floa
     return float(np.mean(vals))
 
 
+def _compute_fade_weight_field(
+    grid,
+    start_xy: np.ndarray,
+    goal_xy: np.ndarray,
+    near_m: float,
+    far_frac: float,
+    w_min: float,
+) -> np.ndarray:
+    """Per-cell weight in [w_min, 1], smaller near goal."""
+    near_m = float(near_m)
+    w_min = float(w_min)
+    if not (0.0 <= w_min <= 1.0):
+        raise ValueError("--path_fade_w_min must be within [0,1]")
+
+    start_to_goal = float(np.linalg.norm(start_xy - goal_xy))
+    far_m = max(near_m + 1.0, float(far_frac) * start_to_goal)
+
+    rows = np.arange(grid.height, dtype=np.int64)
+    cols = np.arange(grid.width, dtype=np.int64)
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+    x = grid.spec.min_x + (cc + 0.5) * float(grid.resolution)
+    y = grid.spec.min_y + (rr + 0.5) * float(grid.resolution)
+    dist = np.sqrt((x - float(goal_xy[0])) ** 2 + (y - float(goal_xy[1])) ** 2)
+
+    w = (dist - near_m) / (far_m - near_m)
+    w = np.clip(w, 0.0, 1.0)
+    w = w_min + (1.0 - w_min) * w
+    return w.astype(np.float32)
+
+def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
+    return (x + np.pi) % (2.0 * np.pi) - np.pi
+
 def _path_to_subgoals(path_xy: np.ndarray, stride_m: float) -> List[np.ndarray]:
     """Convert a dense path into chained subgoals (excluding start, including end)."""
     if len(path_xy) < 2:
@@ -281,6 +340,104 @@ def _path_to_subgoals(path_xy: np.ndarray, stride_m: float) -> List[np.ndarray]:
     goals = [_sample_point_at_distance_with_cum(path_xy, cum=cum, dist_m=float(d)) for d in dists]
     goals.append(np.asarray(path_xy[-1], dtype=np.float64))
     return [np.asarray(g, dtype=np.float64) for g in goals]
+
+
+
+
+def _path_shape_feature(path_xy: np.ndarray, turn_thresh_deg: float) -> np.ndarray:
+    """Low-dim feature summarizing turn pattern of a path."""
+    if len(path_xy) < 3:
+        return np.zeros((12,), dtype=np.float64)
+
+    diffs = np.diff(path_xy, axis=0)
+    seg_len = np.linalg.norm(diffs, axis=1)
+    valid = seg_len > 1e-9
+    if int(np.sum(valid)) < 2:
+        return np.zeros((12,), dtype=np.float64)
+    diffs = diffs[valid]
+    seg_len = seg_len[valid]
+
+    heading = np.arctan2(diffs[:, 1], diffs[:, 0])
+    dtheta = _wrap_to_pi(np.diff(heading))
+    if len(dtheta) == 0:
+        return np.zeros((12,), dtype=np.float64)
+
+    total_len = float(np.sum(seg_len))
+    abs_turn = float(np.sum(np.abs(dtheta)))
+    signed_turn = float(np.sum(dtheta))
+    turn_thresh = np.deg2rad(float(turn_thresh_deg))
+    left_events = float(np.sum(dtheta > turn_thresh))
+    right_events = float(np.sum(dtheta < -turn_thresh))
+    turn_events = left_events + right_events
+    turn_density = turn_events / max(1.0, total_len)
+
+    # 6-bin turn histogram on [-pi, pi]
+    hist, _ = np.histogram(dtheta, bins=6, range=(-np.pi, np.pi))
+    hist = hist.astype(np.float64)
+    hist = hist / max(1.0, float(np.sum(hist)))
+
+    feat = np.concatenate(
+        [
+            np.asarray(
+                [
+                    total_len,
+                    abs_turn,
+                    signed_turn,
+                    left_events,
+                    right_events,
+                    turn_events,
+                    turn_density,
+                ],
+                dtype=np.float64,
+            ),
+            hist,
+        ],
+        axis=0,
+    )
+    return feat
+
+
+def _select_shape_diverse_paths(
+    paths_xy: List[np.ndarray],
+    top_k: int,
+    turn_thresh_deg: float,
+) -> List[np.ndarray]:
+    """Greedy farthest-point selection in turn-shape feature space."""
+    if top_k <= 0 or len(paths_xy) <= top_k:
+        return paths_xy
+
+    feats = np.stack([_path_shape_feature(p, turn_thresh_deg=turn_thresh_deg) for p in paths_xy], axis=0)
+    mean = np.mean(feats, axis=0, keepdims=True)
+    std = np.std(feats, axis=0, keepdims=True) + 1e-6
+    feats = (feats - mean) / std
+
+    lengths = np.asarray([float(_path_cumlen(p)[-1]) if len(p) >= 2 else 0.0 for p in paths_xy], dtype=np.float64)
+    first = int(np.argmin(lengths))
+    selected = [first]
+    remaining = [i for i in range(len(paths_xy)) if i != first]
+    min_d = {i: float(np.linalg.norm(feats[i] - feats[first])) for i in remaining}
+
+    while len(selected) < int(top_k) and remaining:
+        best_i = None
+        best_d = -1.0
+        best_len = float("inf")
+        for i in remaining:
+            d = float(min_d[i])
+            l = float(lengths[i])
+            if d > best_d + 1e-12 or (abs(d - best_d) <= 1e-12 and l < best_len):
+                best_i = i
+                best_d = d
+                best_len = l
+        if best_i is None:
+            break
+        selected.append(best_i)
+        remaining.remove(best_i)
+        for i in remaining:
+            d = float(np.linalg.norm(feats[i] - feats[best_i]))
+            if d < min_d[i]:
+                min_d[i] = d
+
+    return [paths_xy[i] for i in selected]
 
 
 def main() -> None:
@@ -299,7 +456,8 @@ def main() -> None:
     )
     from algo.common.traj_io import ensure_at_least_two_points, next_traj_index, truncate_to_success, write_traj_txt  # noqa: E402
     from algo.memory.repulsion_memory import PerInitialRepulsionMemory, RepulsionMemoryConfig  # noqa: E402
-    from algo.planning.multi_path import MultiPathConfig, plan_diverse_paths  # noqa: E402
+    from algo.planning.astar import astar  # noqa: E402
+    from algo.planning.repulsion import add_path_repulsion  # noqa: E402
     from algo.planning.subgoal_sampler import (  # noqa: E402
         PlannedSubgoalSampler,
         SubgoalSamplerConfig,
@@ -320,7 +478,7 @@ def main() -> None:
     random.seed(data_seed)
     torch.set_num_threads(1)
 
-    initials = _load_initials(args.initials_path, take_first_n=None)
+    initials = _load_initials(args.initials_path, take_first_n=args.collect_take_first_n)
     if _is_main_process(args):
         print(f"Loaded {len(initials)} initials")
 
@@ -340,15 +498,6 @@ def main() -> None:
         seed=data_seed,
     )
     grid = sampler.grid
-
-    multipath_cfg = MultiPathConfig(
-        n_paths=int(args.n_paths),
-        repulsion_strength=float(args.path_repulsion_strength),
-        repulsion_radius_cells=int(args.path_repulsion_radius_cells),
-        repulsion_weight=float(args.path_repulsion_weight),
-        detour_ratio_max=float(args.path_detour_ratio_max),
-        allow_diagonal=False,
-    )
 
     start_by_iid: Dict[int, np.ndarray] = {}
     goal_by_iid: Dict[int, np.ndarray] = {}
@@ -378,8 +527,69 @@ def main() -> None:
         if goal_rc is None:
             continue
 
-        candidates = plan_diverse_paths(grid=grid, start_rc=start_rc, goal_rc=goal_rc, config=multipath_cfg)
+        shortest = astar(grid=grid, start_rc=start_rc, goal_rc=goal_rc, cost_map=None, allow_diagonal=False)
+        if shortest is None:
+            continue
+
+        fade_w = _compute_fade_weight_field(
+            grid=grid,
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            near_m=float(args.path_fade_near_m),
+            far_frac=float(args.path_fade_far_frac),
+            w_min=float(args.path_fade_w_min),
+        )
+
+        planning_memory = np.zeros_like(grid.occupancy, dtype=np.float32)
+        candidates = []
+        base_cost = float(shortest.cost)
+        max_attempts = max(int(args.n_paths) * 3, int(args.n_paths) + 10)
+        repulsion_weight = float(args.path_repulsion_weight)
+        print(f"Calculating {i}th paths")
+        for _attempt in range(max_attempts):
+            if len(candidates) >= int(args.n_paths):
+                break
+
+            cost_map = 1.0 + repulsion_weight * (planning_memory * fade_w)
+            if float(args.path_cost_noise) > 0.0:
+                cost_map = cost_map + float(args.path_cost_noise) * np.random.random(
+                    size=cost_map.shape
+                ).astype(np.float32)
+
+            path = astar(
+                grid=grid,
+                start_rc=start_rc,
+                goal_rc=goal_rc,
+                cost_map=cost_map,
+                allow_diagonal=False,
+            )
+            if path is None:
+                repulsion_weight *= 0.7
+                continue
+            if float(path.cost) > float(args.path_detour_ratio_max) * base_cost:
+                repulsion_weight *= 0.85
+                continue
+
+            candidates.append(path)
+
+            planning_memory *= float(args.path_memory_decay)
+            add_path_repulsion(
+                planning_memory,
+                path.path_rc,
+                strength=float(args.path_repulsion_strength),
+                radius_cells=int(args.path_repulsion_radius_cells),
+            )
+            if float(args.path_memory_max) > 0.0:
+                np.clip(planning_memory, 0.0, float(args.path_memory_max), out=planning_memory)
+
         paths = [np.asarray(res.path_xy, dtype=np.float64) for res in candidates if len(res.path_xy) >= 2]
+        if int(args.path_shape_top_k) > 0:
+            paths = _select_shape_diverse_paths(
+                paths_xy=paths,
+                top_k=int(args.path_shape_top_k),
+                turn_thresh_deg=float(args.path_shape_turn_thresh_deg),
+            )
+        print(f"After selection, remaining {len(paths)} paths")
         if len(paths) == 0:
             continue
 
@@ -393,6 +603,54 @@ def main() -> None:
     if _is_main_process(args):
         avg_paths = float(np.mean([len(path_bank[iid]) for iid in valid_initial_ids]))
         print(f"Valid planned initials: {len(valid_initial_ids)} / {len(initials)}, avg candidate paths={avg_paths:.2f}")
+        
+        
+    if bool(args.plan_only):
+        if args.save_dir is None:
+            args.save_dir = os.path.join("saved_data", f"ppo_{int(time.time())}")
+        args.save_dir = broadcast_object(args.save_dir, src=0)
+
+        if args.collect_plan_output_dir is None:
+            collect_plan_output_dir = os.path.join(args.save_dir, "plan/baseline_trajs")
+        else:
+            collect_plan_output_dir = str(args.collect_plan_output_dir)
+        collect_plan_output_dir = broadcast_object(collect_plan_output_dir, src=0)
+
+        if _is_main_process(args):
+            os.makedirs(args.save_dir, exist_ok=True)
+            os.makedirs(collect_plan_output_dir, exist_ok=True)
+            with open(os.path.join(args.save_dir, "config.json"), "w") as f:
+                json.dump(vars(args), f, indent=2)
+
+            if args.collect_initials_path is not None:
+                plan_initials = _load_initials(args.collect_initials_path, take_first_n=int(args.collect_take_first_n))
+                requested_ids = {_initial_id(init, i) for i, init in enumerate(plan_initials)}
+                target_ids = [int(iid) for iid in sorted(requested_ids) if int(iid) in path_bank]
+            else:
+                target_ids = [int(iid) for iid in sorted(valid_initial_ids)]
+
+            total_written = 0
+            for iid in target_ids:
+                out_init_dir = os.path.join(collect_plan_output_dir, f"initial_{iid}")
+                os.makedirs(out_init_dir, exist_ok=True)
+                n_write = min(int(args.n_paths), len(path_bank[iid]))
+                for k in range(n_write):
+                    out_path = os.path.join(out_init_dir, f"traj_{k}.txt")
+                    path_xy = np.asarray(path_bank[iid][k], dtype=np.float64)
+                    planned_with_start = [(float(start_by_iid[iid][0]), float(start_by_iid[iid][1]))] + [
+                        (float(x), float(y)) for x, y in path_xy
+                    ]
+                    planned_with_start = ensure_at_least_two_points(planned_with_start)
+                    write_traj_txt(out_path, planned_with_start)
+                    total_written += 1
+            print(
+                f"[plan_only] wrote {total_written} planned paths for {len(target_ids)} initials to "
+                f"{collect_plan_output_dir}"
+            )
+        barrier()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        return
 
     mem_cfg = RepulsionMemoryConfig(
         decay=float(args.memory_decay),
@@ -407,6 +665,8 @@ def main() -> None:
         config=mem_cfg,
         seed=data_seed,
     )
+    
+
 
     if args.save_dir is None:
         args.save_dir = os.path.join("saved_data", f"ppo_{int(time.time())}")
@@ -422,6 +682,7 @@ def main() -> None:
     collect_ids: Optional[set[int]] = None
     saved_counts: Dict[int, int] = {}
     collect_output_dir: Optional[str] = None
+    collect_plan_output_dir: Optional[str] = None
     if bool(args.collect_during_train):
         collect_path = args.collect_initials_path or args.initials_path
         collect_initials = _load_initials(collect_path, take_first_n=int(args.collect_take_first_n))
@@ -431,13 +692,20 @@ def main() -> None:
             collect_output_dir = os.path.join(args.save_dir, "baseline_trajs")
         else:
             collect_output_dir = str(args.collect_output_dir)
+        if args.collect_plan_output_dir is None:
+            collect_plan_output_dir = os.path.join(args.save_dir, "baseline_plans")
+        else:
+            collect_plan_output_dir = str(args.collect_plan_output_dir)
 
         if _is_main_process(args):
             os.makedirs(collect_output_dir, exist_ok=True)
+            os.makedirs(collect_plan_output_dir, exist_ok=True)
             for iid in sorted(collect_ids):
-                init_dir = os.path.join(collect_output_dir, f"initial_{iid}")
-                os.makedirs(init_dir, exist_ok=True)
-                saved_counts[iid] = int(next_traj_index(init_dir))
+                traj_init_dir = os.path.join(collect_output_dir, f"initial_{iid}")
+                plan_init_dir = os.path.join(collect_plan_output_dir, f"initial_{iid}")
+                os.makedirs(traj_init_dir, exist_ok=True)
+                os.makedirs(plan_init_dir, exist_ok=True)
+                saved_counts[iid] = int(next_traj_index(traj_init_dir))
             with open(os.path.join(args.save_dir, "collect_config.json"), "w") as f:
                 json.dump(
                     {
@@ -445,6 +713,7 @@ def main() -> None:
                         "collect_take_first_n": int(args.collect_take_first_n),
                         "collect_trajs_per_initial": int(args.collect_trajs_per_initial),
                         "collect_output_dir": collect_output_dir,
+                        "collect_plan_output_dir": collect_plan_output_dir,
                         "final_goal_radius_m": float(args.final_goal_radius_m),
                     },
                     f,
@@ -486,6 +755,20 @@ def main() -> None:
     if not (0.0 < residual_frac <= 1.0):
         raise ValueError("--residual_frac must be within (0,1]")
     guide_frac = 1.0 - residual_frac
+    guide_gain_start = float(args.guide_gain_start)
+    guide_gain_end = float(args.guide_gain_end)
+    if guide_gain_start < 0.0 or guide_gain_end < 0.0:
+        raise ValueError("--guide_gain_start/--guide_gain_end must be >= 0")
+    guide_gain_decay_iters = int(args.guide_gain_decay_iters)
+    if guide_gain_decay_iters <= 0:
+        guide_gain_decay_iters = int(args.max_iter)
+
+    def _guide_gain_at_iter(iter_idx: int) -> float:
+        if guide_gain_decay_iters <= 0:
+            return guide_gain_end
+        t = float(np.clip(float(iter_idx) / float(guide_gain_decay_iters), 0.0, 1.0))
+        return float((1.0 - t) * guide_gain_start + t * guide_gain_end)
+
     residual_action_limit = (full_action_limit[0] * residual_frac, full_action_limit[1] * residual_frac)
     guide_action_limit = (full_action_limit[0] * guide_frac, full_action_limit[1] * guide_frac)
     guide_action_scale = torch.tensor(guide_action_limit, dtype=torch.float32, device=device).unsqueeze(0)
@@ -495,6 +778,13 @@ def main() -> None:
         action_dim=action_dim,
         action_limit=residual_action_limit,  # type: ignore[arg-type]
     ).to(device)
+
+    if args.load_checkpoint is not None:
+        ckpt_path = str(args.load_checkpoint)
+        if _is_main_process(args):
+            state = torch.load(ckpt_path, map_location=device)
+            actor_critic.load_state_dict(state)
+            print(f"Loaded checkpoint: {ckpt_path}")
 
     # Safety: ensure exact parameter match across ranks.
     broadcast_module(actor_critic, src=0)
@@ -549,7 +839,6 @@ def main() -> None:
             # round_robin: for the same initial, use different planned routes in turn.
             cursor = int(path_cursor_by_iid.get(iid, 0))
             chosen_idx = cursor % len(paths)
-            path_cursor_by_iid[iid] = cursor + 1
 
         chosen_path = np.asarray(paths[chosen_idx], dtype=np.float64).copy()
         subgoals = _path_to_subgoals(chosen_path, stride_m=float(args.subgoal_stride_m))
@@ -573,13 +862,18 @@ def main() -> None:
     start_time = time.time()
 
     if _is_main_process(args):
+        init_gain = _guide_gain_at_iter(0)
+        end_gain = _guide_gain_at_iter(int(args.max_iter))
         print(
             f"\nStarting PPO training (residual mode: guide_frac={guide_frac:.2f}, residual_frac={residual_frac:.2f}, "
+            f"guide_gain={init_gain:.2f}->{end_gain:.2f}, "
             f"multi-path n_paths={int(args.n_paths)}, chained_subgoals stride={float(args.subgoal_stride_m):.1f}m) "
             f"(max_iter={args.max_iter}, world_size={getattr(args,'world_size',1)})...\n"
         )
 
     for j in range(args.max_iter):
+        curr_guide_gain = _guide_gain_at_iter(j)
+        curr_guide_action_scale = guide_action_scale * float(curr_guide_gain)
         if bool(args.collect_during_train) and bool(args.stop_when_collected):
             local_stop = 1 if (_is_main_process(args) and _done_collecting()) else 0
             if int(get_world_size()) > 1:
@@ -603,7 +897,7 @@ def main() -> None:
                 cum=path_cum,
                 lookahead_m=float(args.guide_lookahead_m),
             )
-            guide_action = torch.tensor(guide_dir, device=device, dtype=torch.float32).unsqueeze(0) * guide_action_scale
+            guide_action = torch.tensor(guide_dir, device=device, dtype=torch.float32).unsqueeze(0) * curr_guide_action_scale
             # print(guide_action)
             # Residual RL: environment action = A* guide + PPO residual.
             env_action = guide_action + act_out.action
@@ -639,18 +933,24 @@ def main() -> None:
                         curr_subgoal_idx += 1
                         if curr_subgoal_idx >= len(curr_subgoals):
                             is_final = True
-                            # print(f"==========Success Near!======= cu")
+                            # print(f"==========Success Near!======= current idx {curr_subgoal_idx} of total {len(curr_subgoals)}")
                             curr_subgoals.append(np.array(goal_xy, dtype=np.float64).copy())
-                        # print(f"Reach subgoal{curr_subgoal_idx}, forward to next goal, total length of subgoal is {len(curr_subgoals)}")
+                        # print(f"Path {path_cursor_by_iid[curr_iid] % len(paths)} Reach subgoal{curr_subgoal_idx}, forward to next goal, total length of subgoal is {len(curr_subgoals)}")
                         next_obs = env.set_subgoal(curr_subgoals[curr_subgoal_idx], is_final)
                         done = [False]
                         infos = [{}]
                         # Remove terminal bonus for intermediate milestones.
                         reward = reward - float(env.params.success_bonus)
                         episode_return -= float(env.params.success_bonus)
-
+                set_next = False
                 if done[0]:
                     episode_rewards.append(float(episode_return))
+                    if (
+                        str(args.path_select_mode) == "round_robin"
+                        and final_success
+                        and len(path_bank.get(curr_iid, [])) > 1
+                    ):
+                        path_cursor_by_iid[curr_iid] = int(path_cursor_by_iid.get(curr_iid, 0)) + 1
                     memory.update_with_trajectory(curr_iid, traj_xy, success=final_success)
 
                     if (
@@ -658,13 +958,16 @@ def main() -> None:
                         and _is_main_process(args)
                         and collect_ids is not None
                         and collect_output_dir is not None
+                        and collect_plan_output_dir is not None
                         and (curr_iid in collect_ids)
                         and final_success
                         # and (curr_subgoal_idx == 9)
                     ):
+                        # print(f"Current a* path id {path_cursor_by_iid[curr_iid] % len(paths)}")
                         k = int(saved_counts.get(curr_iid, 0))
                         if k < int(args.collect_trajs_per_initial):
                             out_path = os.path.join(collect_output_dir, f"initial_{curr_iid}", f"traj_{k}.txt")
+                            plan_out_path = os.path.join(collect_plan_output_dir, f"initial_{curr_iid}", f"traj_{k}.txt")
                             trimmed = truncate_to_success(
                                 traj_xy,
                                 goal_xy,
@@ -672,6 +975,11 @@ def main() -> None:
                             )
                             trimmed = ensure_at_least_two_points(trimmed)
                             write_traj_txt(out_path, trimmed)
+                            planned_with_start = [
+                                (float(start_xy[0]), float(start_xy[1]))
+                            ] + [(float(x), float(y)) for x, y in path_xy]
+                            planned_with_start = ensure_at_least_two_points(planned_with_start)
+                            write_traj_txt(plan_out_path, planned_with_start)
                             saved_counts[curr_iid] = k + 1
 
                     curr_iid, start_xy, goal_xy, path_xy, curr_subgoals = _sample_episode_state()
@@ -706,7 +1014,8 @@ def main() -> None:
         stats = agent.update(rollouts)
         rollouts.after_update()
 
-        if j % args.log_interval == 0 and len(episode_rewards) > 0:
+        # if j % args.log_interval == 0 and len(episode_rewards) > 0:
+        if True:
             elapsed = time.time() - start_time
             total_steps = (j + 1) * args.num_steps * int(getattr(args, "world_size", 1))
             if _is_main_process(args):
@@ -716,6 +1025,7 @@ def main() -> None:
                 print(
                     f"[Iter {j:6d}] steps={total_steps:9d}  "
                     f"reward={np.mean(episode_rewards):7.1f}  "
+                    f"guide_gain={curr_guide_gain:.3f}  "
                     f"v_loss={stats.value_loss:.4f}{extra}  "
                     f"elapsed={elapsed:.0f}s"
                 )
@@ -740,3 +1050,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+'''
+torchrun --standalone --nproc_per_node=2 train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_20.json \
+    --save_dir saved_data/ppo_residual_multi_debug \
+    --collect_during_train \
+    --collect_take_first_n 20 \
+    --collect_trajs_per_initial 100 \
+    --stop_when_collected \
+    --n_paths 100 \
+    --subgoal_stride_m 35 \
+    --final_goal_radius_m 30 \
+    --memory_reward_weight 2.0 --path_select_mode random --plan_only --path_shape_top_k 5 --path_shape_turn_thresh_deg 25
+'''
