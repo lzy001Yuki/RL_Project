@@ -1,6 +1,7 @@
 # RL Assignment指南
 
-[paper](paper)
+[paper](paper.pdf)
+
 ---
 
 ## 1. 环境准备
