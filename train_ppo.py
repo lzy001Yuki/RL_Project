@@ -20,7 +20,8 @@ import os
 import random
 import time
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -53,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subgoal_max_m", type=float, default=160.0)
     parser.add_argument("--grid_resolution_m", type=float, default=1.0)
     parser.add_argument("--grid_padding_m", type=float, default=5.0)
+    parser.add_argument("--load_checkpoint", type=str, default=None,
+                        help="Optional path to a saved policy checkpoint for continuing PPO training.")
     parser.add_argument("--plan_only", action="store_true",
                         help="Only run dynamic-cost A* planning and save planned paths, without PPO training.")
     parser.add_argument("--grid_inflation_radius_m", type=float, default=4.0)
@@ -61,8 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_snap_radius_m", type=float, default=10.0,
                         help="If start cell is occupied, snap to a nearby free cell within this radius.")
 
-    # Residual RL: action_env = action_guide(A*) + action_residual(PPO)
-    parser.add_argument("--residual_frac", type=float, default=0.55,
+    # Optional residual RL: action_env = action_guide(A*) + action_residual(PPO)
+    parser.add_argument("--use_action_guide", action="store_true",
+                        help="Enable A* guide action and learn residual action with PPO.")
+    parser.add_argument("--residual_frac", type=float, default=0.75,
                         help="Fraction of action limit reserved for PPO residual (rest used by A* guide).")
     parser.add_argument("--guide_lookahead_m", type=float, default=10.0,
                         help="Lookahead distance (meters) along the A* path for guide action.")
@@ -125,12 +130,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--dist_backend", type=str, default=None,
                         help="DDP backend (default: nccl if cuda else gloo)")
-    parser.add_argument("--load_checkpoint", type=str, default=None,
-                        help="Optional path to a saved policy checkpoint for continuing PPO training.")
     parser.add_argument("--path_shape_top_k", type=int, default=0,
                         help="Keep top-K shape-diverse paths per initial (<=0 keeps all planned paths).")
     parser.add_argument("--path_shape_turn_thresh_deg", type=float, default=20.0,
                         help="Turn event threshold (degrees) for path-shape feature extraction.")
+    # Landmark pool (turning-point based) and selection.
+    parser.add_argument("--landmark_turn_thresh_deg", type=float, default=25.0,
+                        help="Turning angle threshold (degrees) for landmark candidate extraction.")
+    parser.add_argument("--landmark_min_separation_m", type=float, default=20.0,
+                        help="Minimum distance between successive turning points on the same path.")
+    parser.add_argument("--landmark_dedup_radius_m", type=float, default=18.0,
+                        help="Radius-NMS threshold for deduplicating turning-point candidates.")
+    parser.add_argument("--landmark_cluster_radius_m", type=float, default=25.0,
+                        help="Spatial clustering radius for landmark candidate aggregation.")
+    parser.add_argument("--landmark_max_per_initial", type=int, default=24,
+                        help="Maximum number of clustered landmarks kept per initial.")
+    parser.add_argument("--landmark_min_progress_m", type=float, default=-10.0,
+                        help="Discard landmark if expected goal progress is below this value.")
+    parser.add_argument("--landmark_score_prog", type=float, default=1.0)
+    parser.add_argument("--landmark_score_mem", type=float, default=1.2)
+    parser.add_argument("--landmark_score_detour", type=float, default=0.2)
+    parser.add_argument("--landmark_score_safe", type=float, default=0.2)
+    parser.add_argument("--landmark_max_hops", type=int, default=12,
+                        help="Upper bound on intermediate landmark transitions per episode.")
     # Online trajectory collection during training (rank0 only).
     parser.add_argument("--collect_during_train", action="store_true")
     parser.add_argument("--collect_initials_path", type=str, default=None,
@@ -440,6 +462,211 @@ def _select_shape_diverse_paths(
     return [paths_xy[i] for i in selected]
 
 
+@dataclass
+class LandmarkCandidate:
+    xy: np.ndarray
+    priority: float
+    support: int
+
+
+def _extract_turn_candidates_from_path(
+    path_xy: np.ndarray,
+    turn_thresh_deg: float,
+    min_separation_m: float,
+) -> List[Tuple[np.ndarray, float]]:
+    if len(path_xy) < 3:
+        return []
+    pts = np.asarray(path_xy, dtype=np.float64)
+    turn_thresh = np.deg2rad(float(turn_thresh_deg))
+    out: List[Tuple[np.ndarray, float]] = []
+    last_xy = pts[0]
+    for i in range(1, len(pts) - 1):
+        u = pts[i] - pts[i - 1]
+        v = pts[i + 1] - pts[i]
+        nu = float(np.linalg.norm(u))
+        nv = float(np.linalg.norm(v))
+        if nu <= 1e-6 or nv <= 1e-6:
+            continue
+        cos = float(np.clip(np.dot(u, v) / (nu * nv + 1e-9), -1.0, 1.0))
+        angle = float(np.arccos(cos))
+        if angle < turn_thresh:
+            continue
+        if float(np.linalg.norm(pts[i] - last_xy)) < float(min_separation_m):
+            continue
+        out.append((pts[i].copy(), angle))
+        last_xy = pts[i]
+    return out
+
+
+def _dedup_candidates_radius_nms(
+    candidates: List[LandmarkCandidate],
+    radius_m: float,
+) -> List[LandmarkCandidate]:
+    if len(candidates) <= 1 or float(radius_m) <= 0.0:
+        return candidates
+    ordered = sorted(candidates, key=lambda x: (float(x.priority), float(x.support)), reverse=True)
+    kept: List[LandmarkCandidate] = []
+    for cand in ordered:
+        keep = True
+        for old in kept:
+            if float(np.linalg.norm(cand.xy - old.xy)) <= float(radius_m):
+                keep = False
+                break
+        if keep:
+            kept.append(cand)
+    return kept
+
+
+def _cluster_candidates_radius(
+    candidates: List[LandmarkCandidate],
+    radius_m: float,
+    max_keep: int,
+) -> List[np.ndarray]:
+    if len(candidates) == 0:
+        return []
+    if float(radius_m) <= 0.0:
+        pts = [np.asarray(c.xy, dtype=np.float64).copy() for c in candidates]
+        if int(max_keep) > 0:
+            return pts[: int(max_keep)]
+        return pts
+
+    n = len(candidates)
+    visited = np.zeros((n,), dtype=bool)
+    clusters: List[List[int]] = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        queue = [i]
+        visited[i] = True
+        comp: List[int] = []
+        while queue:
+            j = queue.pop()
+            comp.append(j)
+            for k in range(n):
+                if visited[k]:
+                    continue
+                if float(np.linalg.norm(candidates[j].xy - candidates[k].xy)) <= float(radius_m):
+                    visited[k] = True
+                    queue.append(k)
+        clusters.append(comp)
+
+    centers: List[Tuple[np.ndarray, float]] = []
+    for comp in clusters:
+        weights = np.asarray([max(1e-3, float(candidates[idx].priority)) for idx in comp], dtype=np.float64)
+        pts = np.stack([np.asarray(candidates[idx].xy, dtype=np.float64) for idx in comp], axis=0)
+        center = np.sum(pts * weights.reshape(-1, 1), axis=0) / float(np.sum(weights))
+        score = float(np.sum(weights))
+        centers.append((center.astype(np.float64), score))
+    centers = sorted(centers, key=lambda x: x[1], reverse=True)
+
+    out = [c[0] for c in centers]
+    if int(max_keep) > 0:
+        out = out[: int(max_keep)]
+    return out
+
+
+def _build_landmark_pool_for_paths(
+    paths: Sequence[np.ndarray],
+    turn_thresh_deg: float,
+    min_separation_m: float,
+    dedup_radius_m: float,
+    cluster_radius_m: float,
+    max_landmarks: int,
+) -> List[np.ndarray]:
+    raw: List[LandmarkCandidate] = []
+    support_count: Dict[Tuple[int, int], int] = {}
+    for path in paths:
+        cand = _extract_turn_candidates_from_path(
+            np.asarray(path, dtype=np.float64),
+            turn_thresh_deg=float(turn_thresh_deg),
+            min_separation_m=float(min_separation_m),
+        )
+        for xy, angle in cand:
+            key = (int(round(float(xy[0]))), int(round(float(xy[1]))))
+            support_count[key] = int(support_count.get(key, 0)) + 1
+            raw.append(LandmarkCandidate(xy=xy.copy(), priority=float(angle), support=1))
+
+    if len(raw) == 0:
+        return []
+
+    for idx, item in enumerate(raw):
+        key = (int(round(float(item.xy[0]))), int(round(float(item.xy[1]))))
+        raw[idx].support = int(support_count.get(key, 1))
+        raw[idx].priority = float(item.priority) * (1.0 + 0.25 * float(raw[idx].support - 1))
+
+    deduped = _dedup_candidates_radius_nms(raw, radius_m=float(dedup_radius_m))
+    clustered = _cluster_candidates_radius(
+        deduped,
+        radius_m=float(cluster_radius_m),
+        max_keep=int(max_landmarks),
+    )
+    return [np.asarray(xy, dtype=np.float64).copy() for xy in clustered]
+
+
+def _mean_memory_around_xy(memory_map: np.ndarray, grid, xy: np.ndarray, radius_cells: int) -> float:
+    r, c = grid.world_to_grid(float(xy[0]), float(xy[1]))
+    if not grid.in_bounds(r, c):
+        return float(np.max(memory_map)) if memory_map.size > 0 else 0.0
+    rad = max(0, int(radius_cells))
+    r0 = max(0, int(r) - rad)
+    r1 = min(memory_map.shape[0], int(r) + rad + 1)
+    c0 = max(0, int(c) - rad)
+    c1 = min(memory_map.shape[1], int(c) + rad + 1)
+    patch = memory_map[r0:r1, c0:c1]
+    if patch.size == 0:
+        return float(memory_map[int(r), int(c)])
+    return float(np.mean(patch))
+
+
+def _select_next_landmark(
+    curr_xy: np.ndarray,
+    goal_xy: np.ndarray,
+    landmarks: Sequence[np.ndarray],
+    visited: Sequence[np.ndarray],
+    memory_map: np.ndarray,
+    grid,
+    env,
+    args: argparse.Namespace,
+    rng: np.random.Generator,
+) -> Optional[np.ndarray]:
+    if len(landmarks) == 0:
+        return None
+
+    denom = max(1e-6, float(args.memory_max))
+    visited_pts = [np.asarray(v, dtype=np.float64) for v in visited]
+    curr_goal_dist = float(np.linalg.norm(curr_xy - goal_xy))
+
+    best_xy: Optional[np.ndarray] = None
+    best_score = -1e18
+    for lm in landmarks:
+        xy = np.asarray(lm, dtype=np.float64)
+        if any(float(np.linalg.norm(xy - vp)) < max(1e-6, float(args.landmark_cluster_radius_m) * 0.5) for vp in visited_pts):
+            continue
+
+        next_goal_dist = float(np.linalg.norm(xy - goal_xy))
+        progress = curr_goal_dist - next_goal_dist
+        if progress < float(args.landmark_min_progress_m):
+            continue
+        detour = float(np.linalg.norm(curr_xy - xy) + np.linalg.norm(xy - goal_xy) - curr_goal_dist)
+        mem_pen = _mean_memory_around_xy(memory_map, grid=grid, xy=xy, radius_cells=int(args.memory_radius_cells)) / denom
+        _rel, obs_dist = env._nearest_obstacle(xy)  # noqa: SLF001
+        safety = float(obs_dist)
+
+        score = (
+            float(args.landmark_score_prog) * progress
+            - float(args.landmark_score_mem) * mem_pen
+            - float(args.landmark_score_detour) * detour
+            + float(args.landmark_score_safe) * safety
+        )
+
+        # tiny tie-break noise for exploration stability
+        score += 1e-4 * float(rng.normal())
+        if score > best_score:
+            best_score = score
+            best_xy = xy
+    return None if best_xy is None else np.asarray(best_xy, dtype=np.float64).copy()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -502,8 +729,8 @@ def main() -> None:
     start_by_iid: Dict[int, np.ndarray] = {}
     goal_by_iid: Dict[int, np.ndarray] = {}
     path_bank: Dict[int, List[np.ndarray]] = {}
-    valid_initial_ids: List[int] = []
-
+    landmark_bank: Dict[int, List[np.ndarray]] = {}
+    valid_initial_ids: List[int] = []   
     for i, init in enumerate(initials):
         iid = _initial_id(init, i)
         start_xy, goal_xy = _extract_xy(init)
@@ -563,12 +790,21 @@ def main() -> None:
                 cost_map=cost_map,
                 allow_diagonal=False,
             )
+            # print(goal_xy)
+            ax_dist = float(np.linalg.norm(goal_xy - grid.grid_to_world(goal_rc[0], goal_rc[1])))
+            if ax_dist > 30.0:
+                print(f"Invalid ax_dist {ax_dist}")
+                exit(0)
             if path is None:
                 repulsion_weight *= 0.7
                 continue
             if float(path.cost) > float(args.path_detour_ratio_max) * base_cost:
                 repulsion_weight *= 0.85
                 continue
+            true_dist = float(np.linalg.norm(path.path_xy[-1] - goal_xy))
+            if true_dist > 30.0:
+                print("Invalid Path")
+                exit(0)
 
             candidates.append(path)
 
@@ -581,7 +817,7 @@ def main() -> None:
             )
             if float(args.path_memory_max) > 0.0:
                 np.clip(planning_memory, 0.0, float(args.path_memory_max), out=planning_memory)
-
+        
         paths = [np.asarray(res.path_xy, dtype=np.float64) for res in candidates if len(res.path_xy) >= 2]
         if int(args.path_shape_top_k) > 0:
             paths = _select_shape_diverse_paths(
@@ -597,12 +833,24 @@ def main() -> None:
         start_by_iid[int(iid)] = start_xy
         goal_by_iid[int(iid)] = goal_xy
         path_bank[int(iid)] = paths
+        landmark_bank[int(iid)] = _build_landmark_pool_for_paths(
+            paths=paths,
+            turn_thresh_deg=float(args.landmark_turn_thresh_deg),
+            min_separation_m=float(args.landmark_min_separation_m),
+            dedup_radius_m=float(args.landmark_dedup_radius_m),
+            cluster_radius_m=float(args.landmark_cluster_radius_m),
+            max_landmarks=int(args.landmark_max_per_initial),
+        )
 
     if len(valid_initial_ids) == 0:
         raise RuntimeError("No valid initial could be planned with current grid/planning settings.")
     if _is_main_process(args):
         avg_paths = float(np.mean([len(path_bank[iid]) for iid in valid_initial_ids]))
-        print(f"Valid planned initials: {len(valid_initial_ids)} / {len(initials)}, avg candidate paths={avg_paths:.2f}")
+        avg_landmarks = float(np.mean([len(landmark_bank.get(iid, [])) for iid in valid_initial_ids]))
+        print(
+            f"Valid planned initials: {len(valid_initial_ids)} / {len(initials)}, "
+            f"avg candidate paths={avg_paths:.2f}, avg clustered landmarks={avg_landmarks:.2f}"
+        )
         
         
     if bool(args.plan_only):
@@ -637,6 +885,10 @@ def main() -> None:
                 for k in range(n_write):
                     out_path = os.path.join(out_init_dir, f"traj_{k}.txt")
                     path_xy = np.asarray(path_bank[iid][k], dtype=np.float64)
+                    
+                    true_dist = float(np.linalg.norm(path_xy[-1] - goal_by_iid[iid]))
+                    if true_dist > 30.0:
+                        print(f"Invalid Path Planned! id:{k} for {iid} data. Goal {goal_xy}->curEnd{path_xy[-1]} {true_dist}")
                     planned_with_start = [(float(start_by_iid[iid][0]), float(start_by_iid[iid][1]))] + [
                         (float(x), float(y)) for x, y in path_xy
                     ]
@@ -693,7 +945,7 @@ def main() -> None:
         else:
             collect_output_dir = str(args.collect_output_dir)
         if args.collect_plan_output_dir is None:
-            collect_plan_output_dir = os.path.join(args.save_dir, "baseline_plans")
+            collect_plan_output_dir = os.path.join(args.save_dir, "plan/baseline_trajs")
         else:
             collect_plan_output_dir = str(args.collect_plan_output_dir)
 
@@ -751,41 +1003,48 @@ def main() -> None:
     action_dim = int(np.prod(env.action_shape))
     full_action_limit = tuple(float(x) for x in env.action_limit.tolist())
 
+    use_action_guide = bool(args.use_action_guide)
     residual_frac = float(args.residual_frac)
-    if not (0.0 < residual_frac <= 1.0):
-        raise ValueError("--residual_frac must be within (0,1]")
-    guide_frac = 1.0 - residual_frac
-    guide_gain_start = float(args.guide_gain_start)
-    guide_gain_end = float(args.guide_gain_end)
-    if guide_gain_start < 0.0 or guide_gain_end < 0.0:
-        raise ValueError("--guide_gain_start/--guide_gain_end must be >= 0")
-    guide_gain_decay_iters = int(args.guide_gain_decay_iters)
-    if guide_gain_decay_iters <= 0:
-        guide_gain_decay_iters = int(args.max_iter)
+    if use_action_guide:
+        if not (0.0 < residual_frac <= 1.0):
+            raise ValueError("--residual_frac must be within (0,1] when --use_action_guide is enabled")
+        guide_frac = 1.0 - residual_frac
+        policy_action_limit = (full_action_limit[0] * residual_frac, full_action_limit[1] * residual_frac)
+        guide_action_limit = (full_action_limit[0] * guide_frac, full_action_limit[1] * guide_frac)
+        guide_action_scale = torch.tensor(guide_action_limit, dtype=torch.float32, device=device).unsqueeze(0)
+        guide_gain_start = float(args.guide_gain_start)
+        guide_gain_end = float(args.guide_gain_end)
+        if guide_gain_start < 0.0 or guide_gain_end < 0.0:
+            raise ValueError("--guide_gain_start/--guide_gain_end must be >= 0")
+        guide_gain_decay_iters = int(args.guide_gain_decay_iters)
+        if guide_gain_decay_iters <= 0:
+            guide_gain_decay_iters = int(args.max_iter)
+    else:
+        policy_action_limit = full_action_limit
+        guide_action_scale = torch.tensor((0.0, 0.0), dtype=torch.float32, device=device).unsqueeze(0)
+        guide_gain_start = 0.0
+        guide_gain_end = 0.0
+        guide_gain_decay_iters = 1
 
     def _guide_gain_at_iter(iter_idx: int) -> float:
+        if not use_action_guide:
+            return 0.0
         if guide_gain_decay_iters <= 0:
             return guide_gain_end
         t = float(np.clip(float(iter_idx) / float(guide_gain_decay_iters), 0.0, 1.0))
         return float((1.0 - t) * guide_gain_start + t * guide_gain_end)
 
-    residual_action_limit = (full_action_limit[0] * residual_frac, full_action_limit[1] * residual_frac)
-    guide_action_limit = (full_action_limit[0] * guide_frac, full_action_limit[1] * guide_frac)
-    guide_action_scale = torch.tensor(guide_action_limit, dtype=torch.float32, device=device).unsqueeze(0)
-
     actor_critic = GaussianActorCritic(
         obs_dim=obs_dim,
         action_dim=action_dim,
-        action_limit=residual_action_limit,  # type: ignore[arg-type]
+        action_limit=policy_action_limit,  # type: ignore[arg-type]
     ).to(device)
-
     if args.load_checkpoint is not None:
         ckpt_path = str(args.load_checkpoint)
         if _is_main_process(args):
             state = torch.load(ckpt_path, map_location=device)
             actor_critic.load_state_dict(state)
             print(f"Loaded checkpoint: {ckpt_path}")
-
     # Safety: ensure exact parameter match across ranks.
     broadcast_module(actor_critic, src=0)
     barrier()
@@ -794,6 +1053,7 @@ def main() -> None:
     # (stochastic actions, minibatch order) while keeping params synchronized.
     torch.manual_seed(data_seed)
     torch.cuda.manual_seed_all(data_seed)
+    
 
     agent = PPO(
         actor_critic=actor_critic,
@@ -824,6 +1084,7 @@ def main() -> None:
         goal_xy = goal_by_iid[iid]
         paths = path_bank[iid]
         mem_map = memory.get(iid)
+        landmarks = landmark_bank.get(iid, [])
 
         if len(paths) == 1:
             chosen_idx = 0
@@ -839,17 +1100,31 @@ def main() -> None:
             # round_robin: for the same initial, use different planned routes in turn.
             cursor = int(path_cursor_by_iid.get(iid, 0))
             chosen_idx = cursor % len(paths)
+            # path_cursor_by_iid[iid] = int(path_cursor_by_iid.get(iid, 0)) + 1
 
         chosen_path = np.asarray(paths[chosen_idx], dtype=np.float64).copy()
-        subgoals = _path_to_subgoals(chosen_path, stride_m=float(args.subgoal_stride_m))
-        return iid, start_xy, goal_xy, chosen_path, subgoals
+        first_landmark = _select_next_landmark(
+            curr_xy=np.asarray(start_xy, dtype=np.float64),
+            goal_xy=np.asarray(goal_xy, dtype=np.float64),
+            landmarks=landmarks,
+            visited=[],
+            memory_map=mem_map,
+            grid=grid,
+            env=env,
+            args=args,
+            rng=rng,
+        )
+        if first_landmark is None:
+            first_landmark = np.asarray(goal_xy, dtype=np.float64).copy()
+        return iid, start_xy, goal_xy, chosen_path, [np.asarray(x, dtype=np.float64).copy() for x in landmarks], first_landmark
 
-    curr_iid, start_xy, goal_xy, path_xy, curr_subgoals = _sample_episode_state()
-    curr_subgoal_idx = 0
+    curr_iid, start_xy, goal_xy, path_xy, curr_landmarks, curr_target_xy = _sample_episode_state()
+    visited_landmarks: List[np.ndarray] = []
+    curr_landmark_hops = 0
     path_cum = _path_cumlen(path_xy)
     obs = env.reset(
         initial_pose=np.array([start_xy[0], start_xy[1], 0.0], dtype=np.float64),
-        subgoal_xy=curr_subgoals[curr_subgoal_idx],
+        subgoal_xy=np.asarray(curr_target_xy, dtype=np.float64),
         final_goal_xy=goal_xy,
     )
     for key in obs:
@@ -864,10 +1139,10 @@ def main() -> None:
     if _is_main_process(args):
         init_gain = _guide_gain_at_iter(0)
         end_gain = _guide_gain_at_iter(int(args.max_iter))
+        mode = "residual+guide" if use_action_guide else "direct-goal-ppo"
         print(
-            f"\nStarting PPO training (residual mode: guide_frac={guide_frac:.2f}, residual_frac={residual_frac:.2f}, "
-            f"guide_gain={init_gain:.2f}->{end_gain:.2f}, "
-            f"multi-path n_paths={int(args.n_paths)}, chained_subgoals stride={float(args.subgoal_stride_m):.1f}m) "
+            f"\nStarting PPO training ({mode}, guide_gain={init_gain:.2f}->{end_gain:.2f}, "
+            f"multi-path n_paths={int(args.n_paths)}, landmark_cluster_r={float(args.landmark_cluster_radius_m):.1f}m) "
             f"(max_iter={args.max_iter}, world_size={getattr(args,'world_size',1)})...\n"
         )
 
@@ -891,17 +1166,17 @@ def main() -> None:
                 act_out = actor_critic.act(obs_step)
 
             curr_xy = np.array([float(env.curr_pose[0]), float(env.curr_pose[1])], dtype=np.float64)
-            guide_dir = _guide_direction_from_path_with_cum(
-                curr_xy=curr_xy,
-                path_xy=path_xy,
-                cum=path_cum,
-                lookahead_m=float(args.guide_lookahead_m),
-            )
-            guide_action = torch.tensor(guide_dir, device=device, dtype=torch.float32).unsqueeze(0) * curr_guide_action_scale
-            # print(guide_action)
-            # Residual RL: environment action = A* guide + PPO residual.
-            env_action = guide_action + act_out.action
-            # env_action = act_out.action
+            if use_action_guide:
+                guide_dir = _guide_direction_from_path_with_cum(
+                    curr_xy=curr_xy,
+                    path_xy=path_xy,
+                    cum=path_cum,
+                    lookahead_m=float(args.guide_lookahead_m),
+                )
+                guide_action = torch.tensor(guide_dir, device=device, dtype=torch.float32).unsqueeze(0) * curr_guide_action_scale
+                env_action = guide_action + act_out.action
+            else:
+                env_action = act_out.action
 
             next_obs, reward, done, infos = env.step(env_action)
             traj_xy.append((float(env.curr_pose[0]), float(env.curr_pose[1])))
@@ -927,31 +1202,46 @@ def main() -> None:
                     curr_xy_now = np.array([float(env.curr_pose[0]), float(env.curr_pose[1])], dtype=np.float64)
                     dist_to_goal = float(np.linalg.norm(curr_xy_now - goal_xy))
                     final_success = dist_to_goal <= float(args.final_goal_radius_m)
-                    
+
                     if not final_success:
-                        # Intermediate subgoal reached: move to next subgoal and keep same episode alive.
-                        curr_subgoal_idx += 1
-                        if curr_subgoal_idx >= len(curr_subgoals):
+                        visited_landmarks.append(np.asarray(curr_target_xy, dtype=np.float64).copy())
+                        curr_landmark_hops += 1
+
+                        next_target: Optional[np.ndarray] = None
+                        if curr_landmark_hops < int(args.landmark_max_hops):
+                            next_target = _select_next_landmark(
+                                curr_xy=curr_xy_now,
+                                goal_xy=np.asarray(goal_xy, dtype=np.float64),
+                                landmarks=curr_landmarks,
+                                visited=visited_landmarks,
+                                memory_map=memory.get(curr_iid),
+                                grid=grid,
+                                env=env,
+                                args=args,
+                                rng=rng,
+                            )
+                        if next_target is None:
+                            next_target = np.asarray(goal_xy, dtype=np.float64).copy()
                             is_final = True
-                            # print(f"==========Success Near!======= current idx {curr_subgoal_idx} of total {len(curr_subgoals)}")
-                            curr_subgoals.append(np.array(goal_xy, dtype=np.float64).copy())
-                        # print(f"Path {path_cursor_by_iid[curr_iid] % len(paths)} Reach subgoal{curr_subgoal_idx}, forward to next goal, total length of subgoal is {len(curr_subgoals)}")
-                        next_obs = env.set_subgoal(curr_subgoals[curr_subgoal_idx], is_final)
+                        else:
+                            is_final = float(np.linalg.norm(next_target - goal_xy)) <= float(args.final_goal_radius_m)
+                        curr_target_xy = np.asarray(next_target, dtype=np.float64).copy()
+
+                        next_obs = env.set_subgoal(curr_target_xy, is_final)
                         done = [False]
                         infos = [{}]
-                        # Remove terminal bonus for intermediate milestones.
                         reward = reward - float(env.params.success_bonus)
                         episode_return -= float(env.params.success_bonus)
-                set_next = False
+
                 if done[0]:
                     episode_rewards.append(float(episode_return))
+                    memory.update_with_trajectory(curr_iid, traj_xy, success=final_success)
                     if (
                         str(args.path_select_mode) == "round_robin"
                         and final_success
                         and len(path_bank.get(curr_iid, [])) > 1
                     ):
                         path_cursor_by_iid[curr_iid] = int(path_cursor_by_iid.get(curr_iid, 0)) + 1
-                    memory.update_with_trajectory(curr_iid, traj_xy, success=final_success)
 
                     if (
                         bool(args.collect_during_train)
@@ -961,12 +1251,11 @@ def main() -> None:
                         and collect_plan_output_dir is not None
                         and (curr_iid in collect_ids)
                         and final_success
-                        # and (curr_subgoal_idx == 9)
                     ):
-                        # print(f"Current a* path id {path_cursor_by_iid[curr_iid] % len(paths)}")
                         k = int(saved_counts.get(curr_iid, 0))
                         if k < int(args.collect_trajs_per_initial):
                             out_path = os.path.join(collect_output_dir, f"initial_{curr_iid}", f"traj_{k}.txt")
+                            collect_plan_output_dir = os.path.join(collect_output_dir, f"baseline_trajs")
                             plan_out_path = os.path.join(collect_plan_output_dir, f"initial_{curr_iid}", f"traj_{k}.txt")
                             trimmed = truncate_to_success(
                                 traj_xy,
@@ -982,12 +1271,13 @@ def main() -> None:
                             write_traj_txt(plan_out_path, planned_with_start)
                             saved_counts[curr_iid] = k + 1
 
-                    curr_iid, start_xy, goal_xy, path_xy, curr_subgoals = _sample_episode_state()
-                    curr_subgoal_idx = 0
+                    curr_iid, start_xy, goal_xy, path_xy, curr_landmarks, curr_target_xy = _sample_episode_state()
+                    visited_landmarks = []
+                    curr_landmark_hops = 0
                     path_cum = _path_cumlen(path_xy)
                     next_obs = env.reset(
                         initial_pose=np.array([start_xy[0], start_xy[1], 0.0], dtype=np.float64),
-                        subgoal_xy=curr_subgoals[curr_subgoal_idx],
+                        subgoal_xy=np.asarray(curr_target_xy, dtype=np.float64),
                         final_goal_xy=goal_xy,
                     )
                     traj_xy = [(float(env.curr_pose[0]), float(env.curr_pose[1]))]
@@ -1014,8 +1304,8 @@ def main() -> None:
         stats = agent.update(rollouts)
         rollouts.after_update()
 
-        # if j % args.log_interval == 0 and len(episode_rewards) > 0:
-        if True:
+        if j % args.log_interval == 0 and len(episode_rewards) > 0:
+        # if True:
             elapsed = time.time() - start_time
             total_steps = (j + 1) * args.num_steps * int(getattr(args, "world_size", 1))
             if _is_main_process(args):
@@ -1063,4 +1353,18 @@ torchrun --standalone --nproc_per_node=2 train_ppo.py \
     --subgoal_stride_m 35 \
     --final_goal_radius_m 30 \
     --memory_reward_weight 2.0 --path_select_mode random --plan_only --path_shape_top_k 5 --path_shape_turn_thresh_deg 25
+    
+    
+    torchrun --standalone --nproc_per_node=2 train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_20.json \
+    --save_dir saved_data/ppo_residual_multi_long_topk5_19 \
+    --collect_during_train \
+    --collect_take_first_n 20 \
+    --collect_trajs_per_initial 3 \
+    --stop_when_collected \
+    --n_paths 50 \
+    --subgoal_stride_m 35 \
+    --final_goal_radius_m 30 \
+    --memory_reward_weight 2.0 --path_select_mode round_robin --residual_frac 0.4  --path_shape_top_k 5 --path_shape_turn_thresh_deg 25 --plan_only
 '''

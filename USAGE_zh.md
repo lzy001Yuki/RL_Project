@@ -304,3 +304,66 @@ python train_sac.py \
   --goal_success_radius_m 30 \
   --start_snap_radius_m 20
 ```
+
+
+
+• 按你现在这版代码，直接跑 train_ppo.py 就行。核心是：默认不启用 action guide，走“多路径
+  + 拐点池 + 去重聚类 + 记忆惩罚 + PPO”。--use_action_guide 是可选开关
+  （train_ppo.py:67）。
+
+  1) 最小可运行（先验证流程）
+
+  python train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_100.json \
+    --save_dir saved_data/ppo_landmark_smoke \
+    --max_iter 20 \
+    --num_steps 64
+
+  2) 正式训练（论文方法，推荐）
+
+  python train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_100.json \
+    --save_dir saved_data/ppo_landmark_full \
+    --max_iter 20000 \
+    --num_steps 256 \
+    --n_paths 8 \
+    --path_shape_top_k 5 \
+    --landmark_turn_thresh_deg 25 \
+    --landmark_dedup_radius_m 18 \
+    --landmark_cluster_radius_m 25 \
+    --landmark_max_per_initial 24 \
+    --landmark_max_hops 12 \
+    --memory_reward_weight 2.0
+
+  3) 如果你要“旧版 residual+guide”一起用
+  加 --use_action_guide（并可调 --residual_frac）：
+
+  ... --use_action_guide --residual_frac 0.75
+
+  4) 边训练边落盘轨迹（提交格式）
+
+  python train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_100.json \
+    --save_dir saved_data/ppo_landmark_collect \
+    --collect_during_train \
+    --collect_take_first_n 20 \
+    --collect_trajs_per_initial 100 \
+    --stop_when_collected
+
+  输出轨迹在 saved_data/ppo_landmark_collect/baseline_trajs（train_ppo.py:157 附近参数定
+  义）。
+
+  5) 只看规划结果（不训练）
+
+  python train_ppo.py \
+    --pointcloud_path data/pointcloud_2d.npy \
+    --initials_path data/eval_initials_100.json \
+    --save_dir saved_data/plan_only \
+    --plan_only \
+    --n_paths 8 \
+    --path_shape_top_k 5
+
+  如果你愿意，我可以再给你一组“更稳成功率”与“更高多样性”两套参数预设。

@@ -1,3 +1,10 @@
 __pycache__
 .DS_STORE
 .codex
+paper.latex
+compare.txt
+collect_fpv_data.py
+base_trajs.png
+our_method.png
+env_airsim_16/
+template.latex
