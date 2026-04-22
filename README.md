@@ -27,8 +27,7 @@ pip install numpy scipy torch matplotlib
 其核心流程是：
 1. 动态代价多路径 A*（multi-path）
 2. 拐点池 + 去重 + 聚类（landmark pool）
-3. 基于记忆惩罚的 landmark 选择
-4. 目标条件 PPO 低层控制
+3. 基于记忆惩罚与landmark选择的PPO
 
 
 Baseline 为
