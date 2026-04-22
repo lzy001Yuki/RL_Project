@@ -14,7 +14,7 @@ pip install numpy scipy torch matplotlib
 
 数据文件默认使用仓库内：
 - `data/pointcloud_2d.npy`
-- `data/eval_initials_100.json`
+- `data/eval_initials_20.json`
 - `data/baseline_diversity.json`
 
 ---
@@ -34,24 +34,6 @@ Baseline 为
 - `_instructor/` 里的简单 PPO 实现
 
 
-
-
-```bash
-python train_ppo.py \
-  --pointcloud_path data/pointcloud_2d.npy \
-  --initials_path data/eval_initials_100.json \
-  --save_dir saved_data/ppo_paper_method \
-  --max_iter 100000 \
-  --num_steps 256 \
-  --n_paths 8 \
-  --path_shape_top_k 5 \
-  --landmark_turn_thresh_deg 25 \
-  --landmark_dedup_radius_m 18 \
-  --landmark_cluster_radius_m 25 \
-  --landmark_max_per_initial 24 \
-  --landmark_max_hops 12 \
-  --memory_reward_weight 2.0
-```
 ---
 
 ## 3. 训练同时采集提交轨迹
@@ -67,10 +49,7 @@ python train_ppo.py \
   --stop_when_collected
 ```
 
-输出目录：
-- 轨迹：`saved_data/ppo_collect/baseline_trajs/initial_*/traj_*.txt`
-- 规划轨迹：`saved_data/ppo_collect/plan/baseline_trajs/...`
-- 日志：`saved_data/ppo_collect/train_log.txt`
+输出轨迹：`saved_data/ppo_collect/baseline_trajs/initial_*/traj_*.txt`
 
 ## 4.评估
 见[README_zh.md](README_zh.md)

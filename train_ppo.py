@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     # Optional residual RL: action_env = action_guide(A*) + action_residual(PPO)
     parser.add_argument("--use_action_guide", action="store_true",
                         help="Enable A* guide action and learn residual action with PPO.")
-    parser.add_argument("--residual_frac", type=float, default=0.75,
+    parser.add_argument("--residual_frac", type=float, default=0.35,
                         help="Fraction of action limit reserved for PPO residual (rest used by A* guide).")
     parser.add_argument("--guide_lookahead_m", type=float, default=10.0,
                         help="Lookahead distance (meters) along the A* path for guide action.")
@@ -790,11 +790,6 @@ def main() -> None:
                 cost_map=cost_map,
                 allow_diagonal=False,
             )
-            # print(goal_xy)
-            ax_dist = float(np.linalg.norm(goal_xy - grid.grid_to_world(goal_rc[0], goal_rc[1])))
-            if ax_dist > 30.0:
-                print(f"Invalid ax_dist {ax_dist}")
-                exit(0)
             if path is None:
                 repulsion_weight *= 0.7
                 continue
@@ -804,7 +799,7 @@ def main() -> None:
             true_dist = float(np.linalg.norm(path.path_xy[-1] - goal_xy))
             if true_dist > 30.0:
                 print("Invalid Path")
-                exit(0)
+            
 
             candidates.append(path)
 
@@ -853,7 +848,7 @@ def main() -> None:
         )
         
         
-    if bool(args.plan_only):
+    if True:
         if args.save_dir is None:
             args.save_dir = os.path.join("saved_data", f"ppo_{int(time.time())}")
         args.save_dir = broadcast_object(args.save_dir, src=0)
@@ -882,6 +877,7 @@ def main() -> None:
                 out_init_dir = os.path.join(collect_plan_output_dir, f"initial_{iid}")
                 os.makedirs(out_init_dir, exist_ok=True)
                 n_write = min(int(args.n_paths), len(path_bank[iid]))
+                valid_paths = []
                 for k in range(n_write):
                     out_path = os.path.join(out_init_dir, f"traj_{k}.txt")
                     path_xy = np.asarray(path_bank[iid][k], dtype=np.float64)
@@ -889,12 +885,16 @@ def main() -> None:
                     true_dist = float(np.linalg.norm(path_xy[-1] - goal_by_iid[iid]))
                     if true_dist > 30.0:
                         print(f"Invalid Path Planned! id:{k} for {iid} data. Goal {goal_xy}->curEnd{path_xy[-1]} {true_dist}")
-                    planned_with_start = [(float(start_by_iid[iid][0]), float(start_by_iid[iid][1]))] + [
+                    else:
+                        valid_paths.append(path_xy)
+                        planned_with_start = [(float(start_by_iid[iid][0]), float(start_by_iid[iid][1]))] + [
                         (float(x), float(y)) for x, y in path_xy
                     ]
-                    planned_with_start = ensure_at_least_two_points(planned_with_start)
-                    write_traj_txt(out_path, planned_with_start)
-                    total_written += 1
+                        planned_with_start = ensure_at_least_two_points(planned_with_start)
+                        write_traj_txt(out_path, planned_with_start)
+                        total_written += 1
+                print(f"Valide Path : {len(valid_paths)}")
+                path_bank[iid] = valid_paths
             print(
                 f"[plan_only] wrote {total_written} planned paths for {len(target_ids)} initials to "
                 f"{collect_plan_output_dir}"

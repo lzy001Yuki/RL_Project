@@ -20,7 +20,7 @@ def astar(
     goal_rc: Tuple[int, int],
     cost_map: Optional[np.ndarray] = None,
     allow_diagonal: bool = True,
-    goal_tolerance_m: float = 0.0,
+    goal_tolerance_m: float = 30.0,
 ) -> Optional[AStarResult]:
     """A* on a boolean occupancy grid.
 

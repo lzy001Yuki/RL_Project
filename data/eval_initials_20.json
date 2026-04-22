@@ -1,0 +1,182 @@
+[
+    {
+    "initial_id": 0,
+    "x_start": -1192.22,
+    "y_start": -440.36,
+    "target_id": 171,
+    "target_center_x": -1073.2149680323248,
+    "target_center_y": -173.15276841541265,
+    "distance": 292.51
+  },
+  {
+    "initial_id": 1,
+    "x_start": -1190.34,
+    "y_start": -216.27,
+    "target_id": 214,
+    "target_center_x": -1162.693006680789,
+    "target_center_y": -455.7588142069695,
+    "distance": 241.08
+  },
+  {
+    "initial_id": 2,
+    "x_start": -1190.34,
+    "y_start": -216.27,
+    "target_id": 322,
+    "target_center_x": -1191.5172002251975,
+    "target_center_y": 60.588729952542,
+    "distance": 276.86
+  },
+  {
+    "initial_id": 3,
+    "x_start": -1182.81,
+    "y_start": -312.31,
+    "target_id": 121,
+    "target_center_x": -1050.3707082340131,
+    "target_center_y": -463.1701316955371,
+    "distance": 200.75
+  },
+  {
+    "initial_id": 4,
+    "x_start": -1163.98,
+    "y_start": -308.54,
+    "target_id": 228,
+    "target_center_x": -1173.7591525687776,
+    "target_center_y": -82.39894731710369,
+    "distance": 226.35
+  },
+  {
+    "initial_id": 5,
+    "x_start": -1159.27,
+    "y_start": -547.7,
+    "target_id": 33,
+    "target_center_x": -1045.8472159710293,
+    "target_center_y": -381.10277827816,
+    "distance": 201.54
+  },
+  {
+    "initial_id": 6,
+    "x_start": -1144.2,
+    "y_start": -171.08,
+    "target_id": 97,
+    "target_center_x": -904.4685470554579,
+    "target_center_y": -201.4177949639536,
+    "distance": 241.64
+  },
+  {
+    "initial_id": 7,
+    "x_start": -1131.022682695048,
+    "y_start": 11.579655668835017,
+    "target_id": 310,
+    "target_center_x": -850.6832052930441,
+    "target_center_y": -37.7749809640715,
+    "distance": 284.65
+  },
+  {
+    "initial_id": 8,
+    "x_start": -1113.13,
+    "y_start": -155.07,
+    "target_id": 98,
+    "target_center_x": -917.3541491367306,
+    "target_center_y": -202.1674362781905,
+    "distance": 201.36
+  },
+  {
+    "initial_id": 9,
+    "x_start": -1108.43,
+    "y_start": -311.37,
+    "target_id": 223,
+    "target_center_x": -877.528687276958,
+    "target_center_y": -201.89177435053492,
+    "distance": 255.54
+  },
+  {
+    "initial_id": 10,
+    "x_start": -1107.48,
+    "y_start": -547.7,
+    "target_id": 219,
+    "target_center_x": -1175.0039677389493,
+    "target_center_y": -255.8839844629224,
+    "distance": 299.53
+  },
+  {
+    "initial_id": 11,
+    "x_start": -1105.6,
+    "y_start": 10.64,
+    "target_id": 78,
+    "target_center_x": -810.0694605796947,
+    "target_center_y": -0.09568284122887827,
+    "distance": 295.73
+  },
+  {
+    "initial_id": 12,
+    "x_start": -1105.6,
+    "y_start": 10.64,
+    "target_id": 310,
+    "target_center_x": -850.6832052930441,
+    "target_center_y": -37.7749809640715,
+    "distance": 259.47
+  },
+  {
+    "initial_id": 13,
+    "x_start": -1096.19,
+    "y_start": 43.59,
+    "target_id": 132,
+    "target_center_x": -1174.7678389955988,
+    "target_center_y": -196.71583680263853,
+    "distance": 252.83
+  },
+  {
+    "initial_id": 14,
+    "x_start": -1095.24,
+    "y_start": -49.62,
+    "target_id": 68,
+    "target_center_x": -1026.060814442354,
+    "target_center_y": -272.7936783061308,
+    "distance": 233.65
+  },
+  {
+    "initial_id": 15,
+    "x_start": -1090.54,
+    "y_start": -312.31,
+    "target_id": 331,
+    "target_center_x": -912.2400427066872,
+    "target_center_y": -164.33291373322876,
+    "distance": 231.71
+  },
+  {
+    "initial_id": 16,
+    "x_start": -1077.35,
+    "y_start": -151.31,
+    "target_id": 8,
+    "target_center_x": -987.5342486141474,
+    "target_center_y": -336.9411416944305,
+    "distance": 206.22
+  },
+  {
+    "initial_id": 17,
+    "x_start": -1075.47,
+    "y_start": -112.7,
+    "target_id": 33,
+    "target_center_x": -1045.8472159710293,
+    "target_center_y": -381.10277827816,
+    "distance": 270.03
+  },
+  {
+    "initial_id": 18,
+    "x_start": -1074.53,
+    "y_start": -218.16,
+    "target_id": 329,
+    "target_center_x": -947.4549137501582,
+    "target_center_y": -39.2410527480276,
+    "distance": 219.45
+  },
+  {
+    "initial_id": 19,
+    "x_start": -1051.93,
+    "y_start": -215.33,
+    "target_id": 324,
+    "target_center_x": -1179.8820035432877,
+    "target_center_y": 26.346245730842725,
+    "distance": 273.46
+  }
+]
