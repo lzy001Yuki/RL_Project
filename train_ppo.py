@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
                         help="Count as final success when within this radius of final goal center.")
 
     # Multi-path planning (instead of single fixed A* route).
-    parser.add_argument("--n_paths", type=int, default=8,
+    parser.add_argument("--n_paths", type=int, default=50,
                         help="Number of diverse A* candidates per initial.")
     parser.add_argument("--path_repulsion_strength", type=float, default=5.0)
     parser.add_argument("--path_repulsion_radius_cells", type=int, default=2)
@@ -285,6 +285,7 @@ def _find_free_cell_within_radius(grid, target_xy: np.ndarray, radius_m: float) 
 
     best_rc: Optional[Tuple[int, int]] = None
     best_dist2 = float("inf")
+    total_rc = []
     for dr in range(-max_cells, max_cells + 1):
         for dc in range(-max_cells, max_cells + 1):
             r = r0 + dr
@@ -293,11 +294,12 @@ def _find_free_cell_within_radius(grid, target_xy: np.ndarray, radius_m: float) 
                 continue
             x, y = grid.grid_to_world(r, c)
             d2 = (x - float(target_xy[0])) ** 2 + (y - float(target_xy[1])) ** 2
+            if d2 <= radius_m**2:
+                total_rc.append((int(r), int(c)))
             if d2 <= radius_m**2 and d2 < best_dist2:
                 best_dist2 = d2
                 best_rc = (int(r), int(c))
-    return best_rc
-
+    return best_rc, total_rc
 
 def _path_memory_mean(path_xy: np.ndarray, grid, memory_map: np.ndarray) -> float:
     vals: List[float] = []
@@ -739,24 +741,35 @@ def main() -> None:
         if not grid.in_bounds(*start_rc):
             continue
         if not grid.is_free(*start_rc):
-            snapped = _find_free_cell_within_radius(grid, start_xy, radius_m=float(args.start_snap_radius_m))
+            snapped, _ = _find_free_cell_within_radius(grid, start_xy, radius_m=float(args.start_snap_radius_m))
             if snapped is None:
                 continue
             start_rc = snapped
 
         goal_rc: Optional[Tuple[int, int]] = None
         radius = float(args.goal_success_radius_m)
+        total_free_rc = []
         for _ in range(3):
-            goal_rc = _find_free_cell_within_radius(grid, goal_xy, radius_m=radius)
+            goal_rc, total_free_rc = _find_free_cell_within_radius(grid, goal_xy, radius_m=radius)
             if goal_rc is not None:
+                # total_free_rc = [goal_rc]
                 break
             radius *= 2.0
         if goal_rc is None:
             continue
+        valid_goal_rc = []
+        valid_goal = None
+        for rc_goal in total_free_rc:
+            shortest = astar(grid=grid, start_rc=start_rc, goal_rc=rc_goal, cost_map=None, allow_diagonal=False)
+            if shortest is None:
+                # print(f"Goal_rc {rc_goal} is invalid, switch to next")
+                continue
+            # valid_goal = rc_goal
+            # goal_rc = rc_goal
+            # break
+            # print(f"Goal {rc_goal} has success path !")
+            valid_goal_rc.append(rc_goal)
 
-        shortest = astar(grid=grid, start_rc=start_rc, goal_rc=goal_rc, cost_map=None, allow_diagonal=False)
-        if shortest is None:
-            continue
 
         fade_w = _compute_fade_weight_field(
             grid=grid,
@@ -782,7 +795,14 @@ def main() -> None:
                 cost_map = cost_map + float(args.path_cost_noise) * np.random.random(
                     size=cost_map.shape
                 ).astype(np.float32)
-
+            goal_rc = random.choice(valid_goal_rc)
+            # path = astar(
+            #     grid=grid,
+            #     start_rc=start_rc,
+            #     goal_rc=goal_rc,
+            #     cost_map=cost_map,
+            #     allow_diagonal=False,
+            # )
             path = astar(
                 grid=grid,
                 start_rc=start_rc,
@@ -790,6 +810,7 @@ def main() -> None:
                 cost_map=cost_map,
                 allow_diagonal=False,
             )
+            # print(goal_xy)
             if path is None:
                 repulsion_weight *= 0.7
                 continue
@@ -799,7 +820,7 @@ def main() -> None:
             true_dist = float(np.linalg.norm(path.path_xy[-1] - goal_xy))
             if true_dist > 30.0:
                 print("Invalid Path")
-            
+                # exit(0)
 
             candidates.append(path)
 
@@ -828,15 +849,6 @@ def main() -> None:
         start_by_iid[int(iid)] = start_xy
         goal_by_iid[int(iid)] = goal_xy
         path_bank[int(iid)] = paths
-        landmark_bank[int(iid)] = _build_landmark_pool_for_paths(
-            paths=paths,
-            turn_thresh_deg=float(args.landmark_turn_thresh_deg),
-            min_separation_m=float(args.landmark_min_separation_m),
-            dedup_radius_m=float(args.landmark_dedup_radius_m),
-            cluster_radius_m=float(args.landmark_cluster_radius_m),
-            max_landmarks=int(args.landmark_max_per_initial),
-        )
-
     if len(valid_initial_ids) == 0:
         raise RuntimeError("No valid initial could be planned with current grid/planning settings.")
     if _is_main_process(args):
@@ -902,7 +914,6 @@ def main() -> None:
         barrier()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-        return
 
     mem_cfg = RepulsionMemoryConfig(
         decay=float(args.memory_decay),

@@ -75,13 +75,14 @@ def _find_free_cell_within_radius(
     """Return a free cell (row,col) closest to target within radius, or None."""
     radius_m = float(radius_m)
     r0, c0 = grid.world_to_grid(float(target_xy[0]), float(target_xy[1]))
+    # print(f"target_grid {(r0, c0)}")
     max_cells = int(np.ceil(radius_m / grid.resolution))
     if max_cells < 0:
         return None
 
     best_rc: Optional[Tuple[int, int]] = None
     best_dist2 = float("inf")
-
+    total_rc = []
     for dr in range(-max_cells, max_cells + 1):
         for dc in range(-max_cells, max_cells + 1):
             r = r0 + dr
@@ -90,11 +91,14 @@ def _find_free_cell_within_radius(
                 continue
             x, y = grid.grid_to_world(r, c)
             d2 = (x - float(target_xy[0])) ** 2 + (y - float(target_xy[1])) ** 2
+            if d2 <= radius_m**2:
+                total_rc.append((r, c))
             if d2 <= radius_m**2 and d2 < best_dist2:
                 best_dist2 = d2
                 best_rc = (r, c)
-
-    return best_rc
+    # print(f"best rx is {best_rc}, total {total_rc}")
+    # exit(0)
+    return best_rc, total_rc
 
 
 class PlannedSubgoalSampler:
@@ -150,26 +154,32 @@ class PlannedSubgoalSampler:
             if not self.grid.in_bounds(*start_rc):
                 continue
             if not self.grid.is_free(*start_rc):
-                snapped = _find_free_cell_within_radius(self.grid, start_xy, radius_m=config.start_snap_radius_m)
+                snapped, _ = _find_free_cell_within_radius(self.grid, start_xy, radius_m=config.start_snap_radius_m)
                 if snapped is None:
                     continue
                 start_rc = snapped
-
+            total_free_rc = []
             goal_rc: Optional[Tuple[int, int]] = None
             radius = float(config.goal_success_radius_m)
             for _ in range(max(1, int(config.goal_search_tries))):
-                goal_rc = _find_free_cell_within_radius(self.grid, goal_xy, radius_m=radius)
+                goal_rc, total_free_rc = _find_free_cell_within_radius(self.grid, goal_xy, radius_m=radius)
+                # goal_rc = self.grid.world_to_grid(goal_xy[0] - 25, goal_xy[1])
+                print(f"Current goal rc {goal_rc}, xy {goal_xy}")
                 if goal_rc is not None:
+                    # total_free_rc = [goal_rc]
                     break
                 radius *= float(config.goal_search_expand)
             if goal_rc is None:
                 continue
-
-            result = astar(self.grid, start_rc, goal_rc, allow_diagonal=config.allow_diagonal)
-            if result is None or len(result.path_xy) < 2:
-                continue
-            self._paths_xy[iid] = np.asarray(result.path_xy, dtype=np.float64)
-            self._valid_initial_ids.append(iid)
+            result = None
+            for rc_goal in total_free_rc:
+                result = astar(self.grid, start_rc, rc_goal, allow_diagonal=config.allow_diagonal)
+                # print(f"result is none. Current goal is {rc_goal}")
+                if result is None or len(result.path_xy) < 2:
+                    continue
+            if result is not None:
+                self._paths_xy[iid] = np.asarray(result.path_xy, dtype=np.float64)
+                self._valid_initial_ids.append(iid)
 
         if not self._valid_initial_ids:
             raise RuntimeError(

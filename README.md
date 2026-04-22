@@ -1,6 +1,6 @@
 # RL Assignment指南
 
-[paper](paper.pdf) [trajectories collection](submission/baseline_trajs/)
+[paper](paper.pdf) [trajectories collection](submission/baseline_trajs/) [code](https://github.com/lzy001Yuki/RL_Project)
 
 ---
 

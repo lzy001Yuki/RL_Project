@@ -94,6 +94,7 @@ def astar(
         _f, current = heapq.heappop(open_heap)
         if current in goal_cells:
             # Reconstruct
+            # print(f"Current {current} in {goal_cells}")
             path_rc: List[Tuple[int, int]] = [current]
             while current in came_from:
                 current = came_from[current]
@@ -101,6 +102,11 @@ def astar(
             path_rc.reverse()
 
             path_xy = [grid.grid_to_world(r, c) for r, c in path_rc]
+            # true_dist = float(np.linalg.norm(path_xy[-1] - grid.grid_to_world(goal_rc[0], goal_rc[1])))
+            # print(grid.grid_to_world(goal_rc[0], goal_rc[1]))
+            true_dist = float(np.linalg.norm(np.asarray(path_xy[-1]) - np.asarray(grid.grid_to_world(goal_rc[0], goal_rc[1]))))
+            if true_dist > 30.0:
+                print(true_dist)
             return AStarResult(path_rc=path_rc, path_xy=path_xy, cost=g_score[path_rc[-1]])
 
         current_g = g_score[current]
@@ -108,6 +114,8 @@ def astar(
             nr = current[0] + dr
             nc = current[1] + dc
             if not grid.is_free(nr, nc):
+                # print(f"grid {(nr, nc)}is not free")
+                # exit(0)
                 continue
 
             base = step_cost(dr, dc) * grid.resolution
@@ -118,10 +126,11 @@ def astar(
 
             neighbor = (nr, nc)
             prev = g_score.get(neighbor, float("inf"))
+
             if tentative < prev:
+
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative
                 f_score = tentative + heuristic_to_goal_set(neighbor)
                 heapq.heappush(open_heap, (f_score, neighbor))
-
     return None
